@@ -594,6 +594,61 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // ---------- 2.4 GHz channel + width recommendation ----------
+    // Scores channels 1/6/11 by neighbour signal; overlap weight falls off with channel distance.
+    // shortcut: own router skipped by BSSID prefix (first 5 octets), fine for Huawei.
+    @Suppress("DEPRECATION")
+    private fun recommend24(): Triple<Int, Boolean, String>? {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wm.startScan()  // Android throttles scans, so results may be a few minutes old
+        val all = wm.scanResults
+        if (all.isEmpty()) return null
+        val own = wm.connectionInfo?.bssid?.take(14) ?: ""
+        val aps = all.filter { it.frequency in 2400..2500 && !(own.isNotEmpty() && it.BSSID.startsWith(own, true)) }
+        val score = listOf(1, 6, 11).associateWith { cand ->
+            aps.map { ap ->
+                val d = Math.abs((ap.frequency - 2407) / 5 - cand)
+                if (d >= 5) 0 else (ap.level + 100).coerceAtLeast(1) * (5 - d)
+            }.sum()
+        }
+        val best = score.minByOrNull { it.value }!!.key
+        val wide = aps.size < 4   // 40 MHz only when the band is quiet
+        return Triple(best, wide, "Channel $best, ${if (wide) 40 else 20} MHz. " +
+                "${aps.size} other APs seen on 2.4 GHz; channel $best is the least crowded.")
+    }
+
+    private fun chan24Card(): LinearLayout {
+        var rec: Pair<Int, Boolean>? = null
+        val out = txt("Scan nearby Wi-Fi for a suggestion.", 12f, pal.text)
+        val scanBtn = pillButton("Scan", pal.accent, false) {
+            val r = try { recommend24() } catch (e: SecurityException) { null }
+            if (r == null) out.text = "No scan data. Allow Location, turn it on, retry."
+            else { rec = Pair(r.first, r.second); out.text = r.third }
+        }
+        val applyBtn = pillButton("Apply", pal.accent, true) {
+            val (ch, wide) = rec ?: return@pillButton
+            val c = client ?: run { needLogin(); return@pillButton }
+            dlg().setTitle("Set 2.4 GHz to channel $ch, ${if (wide) 40 else 20} MHz?")
+                .setMessage("Devices on 2.4 GHz disconnect briefly.")
+                .setPositiveButton("Apply") { _, _ ->
+                    say("Changing channel ...")
+                    bg({ c.setChannel24(ch, wide) }) { r ->
+                        r.onSuccess { say("Sent. Reconnect if Wi-Fi dropped.") }
+                        r.onFailure { say("Failed: ${it.message}") }
+                    }
+                }
+                .setNegativeButton("Cancel", null).show()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(WC, dp(44)).apply { setMargins(dp(8), 0, 0, 0) }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(txt("Recommended channel", 13f, pal.text, true).apply { setPadding(0, dp(12), 0, dp(4)) })
+            addView(out)
+            addView(row(scanBtn, applyBtn).apply { setPadding(0, dp(8), 0, 0) })
+        }
+    }
+
     private fun copyMac(mac: String) {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("mac", mac))
@@ -782,7 +837,9 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(16), dp(8), dp(16), 0) }
         }
         val wifiNote = "Needs router login. Leave the name or the password blank to change only the other one."
-        val w24 = panel().apply { addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("2.4 GHz", 1)) }
+        val w24 = panel().apply {
+            addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("2.4 GHz", 1)); addView(chan24Card())
+        }
         val w5 = panel().apply { addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("5 GHz", 5)) }
         val wifiCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1606,6 +1663,25 @@ class MainActivity : Activity() {
                     "&w.MixAuthenticationMode=EAPAuthentication&w.MixEncryptionModes=AESEncryption" +
                     "&w.SSIDAdvertisementEnabled=1&w.WMMEnable=1&w.MaxAssociateNum=10&w.BeaconType=11i" +
                     "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(token)}"
+
+        // 2.4G channel + width. Body copied from the browser capture (same endpoint for both changes).
+        // shortcut: HT20=1 assumed to mean 20 MHz and 0 = 20/40; other fields hardcoded to the captured values.
+        fun setChannel24(ch: Int, wide: Boolean) {
+            log.clear()
+            val url = "$ADV_SET?x=$WLAN_OBJ.1.X_HW_AdvanceConf&y=$WLAN_OBJ.1" +
+                    "&r=InternetGatewayDevice.LANDevice.1.WiFi.Radio.1&RequestFile=${ADV_PAGE.trimStart('/')}"
+            referer = "https://$host$ADV_PAGE"
+            try {
+                // a wrong token is ignored silently, so send with both token kinds
+                for (kind in 0..1) try {
+                    val t = (if (kind == 0) pageToken(ADV_PAGE) else cfgToken()) ?: continue
+                    post(url, "y.Channel=$ch&y.AutoChannelEnable=0&y.X_HW_HT20=${if (wide) 0 else 1}" +
+                            "&y.RegulatoryDomain=PH&y.TransmitPower=100&y.X_HW_Standard=11bgn&x.DtimPeriod=1" +
+                            "&x.BeaconPeriod=100&x.RTSThreshold=2346&x.FragThreshold=2346&z.BandSteeringPolicy=1" +
+                            "&x.X_HW_Token=${enc(t)}")
+                } catch (e: Exception) { }
+            } finally { referer = null }
+        }
     }
 
     private fun parseFilter(text: String): List<FilterEntry> {
@@ -1880,6 +1956,9 @@ class MainActivity : Activity() {
         private const val WLAN_COVER = "InternetGatewayDevice.X_HW_DEBUG.AMP.WifiCoverSetWlanBasic"
         private const val WLAN_SET = "/html/amp/wlanbasic/set.cgi"
         private const val WLAN_OBJ = "InternetGatewayDevice.LANDevice.1.WLANConfiguration"
+        // Router endpoints for 2.4G channel + width (copied from the browser capture).
+        private const val ADV_PAGE = "/html/amp/wlanadv/WlanAdvance.asp"
+        private const val ADV_SET = "/html/amp/wlanadv/set.cgi"
 
         private fun hex(s: String) = Color.parseColor(s)
 
