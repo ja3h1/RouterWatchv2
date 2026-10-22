@@ -1114,11 +1114,11 @@ class MainActivity : Activity() {
         deviceList.addView(
             txt("Router mode decides meaning: whitelist = allowed, blacklist = blocked.", 12f, pal.muted)
                 .apply { setPadding(dp(4), 0, dp(4), dp(4)) }, 0)
-        deviceList.addView(whitelistCard(), 0)
+        deviceList.addView(whitelistCard(list), 0)
     }
 
     // ---------- whitelist on/off switch ----------
-    private fun whitelistCard(): LinearLayout {
+    private fun whitelistCard(list: List<FilterEntry>): LinearLayout {
         val known = wlEnabled != null
         val sw = Switch(this).apply {
             isChecked = wlEnabled == true
@@ -1159,6 +1159,10 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
             addView(title)
             addView(txt(sub, 12f, pal.muted))
+            val n1 = list.count { it.ssid.filter { c -> c.isDigit() } == "1" }
+            val n5 = list.count { it.ssid.filter { c -> c.isDigit() } == "5" }
+            addView(txt("SSID 1 (2.4 GHz): $n1 listed   |   SSID 5 (5 GHz): $n5 listed", 12f, pal.text, true)
+                .apply { setPadding(0, dp(6), 0, 0) })
             if (!known || wlGuess) {
                 val btns = row(
                     pillButton("Check", pal.accent, false) { loadFilter() },
