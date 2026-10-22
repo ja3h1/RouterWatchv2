@@ -50,16 +50,11 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-import javax.net.ssl.HostnameVerifier
-import javax.net.ssl.HttpsURLConnection
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
 
 data class Dev(val host: String, val ip: String, val mac: String, val status: String, val ssid: Int = 1)
 data class FilterEntry(val domain: String, val ssid: String, val name: String, val mac: String)
 
-/** All colors for one theme. LIGHT and DARK live in the companion object at the bottom. */
+/** Color Palette for themes */
 class Pal(
     val dark: Boolean,
     val bg: Int, val surface: Int, val tile: Int, val tag: Int, val line: Int,
@@ -78,7 +73,7 @@ const val ICON_PULSE = 5
 const val ICON_WIFI = 6
 const val ICON_SLIDERS = 7
 
-/** MAC Vendor Lookup helper for instant brand identification based on OUI prefix. */
+/** MAC Vendor Lookup helper for instant offline device brand detection */
 object MacVendorLookup {
     private val knownVendors = mapOf(
         "00:03:93" to "Apple", "00:05:02" to "Apple", "00:0A:95" to "Apple",
@@ -93,7 +88,8 @@ object MacVendorLookup {
         "00:0A:EB" to "TP-Link", "00:1D:0F" to "TP-Link", "00:27:19" to "TP-Link",
         "00:0B:6B" to "Wistron", "00:1E:10" to "Huawei", "00:25:9E" to "Huawei",
         "00:1A:11" to "Google", "00:1A:73" to "Sony", "00:1E:C2" to "Apple",
-        "3C:22:FB" to "Xiaomi", "64:09:80" to "Xiaomi", "DC:21:5E" to "Xiaomi"
+        "3C:22:FB" to "Xiaomi", "64:09:80" to "Xiaomi", "DC:21:5E" to "Xiaomi",
+        "00:E0:4C" to "Realtek", "00:50:56" to "VMware", "08:00:27" to "VirtualBox"
     )
 
     fun cleanMac(mac: String): String {
@@ -110,7 +106,7 @@ object MacVendorLookup {
     }
 }
 
-/** Small line icons drawn with Canvas (24x24 grid, same shapes as the design). */
+/** Vector icons drawn on Canvas */
 class IconView(ctx: Context, private val kind: Int, tintColor: Int) : View(ctx) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -190,7 +186,7 @@ class MainActivity : Activity() {
     private lateinit var vRouterSub: TextView
     private lateinit var vNet: TextView
     private lateinit var vNetSub: TextView
-    private lateinit var vBars: View
+    private lateinit var vBars: BarsView
     private lateinit var vDown: TextView
     private lateinit var vUp: TextView
     private lateinit var speedStatus: TextView
@@ -213,14 +209,12 @@ class MainActivity : Activity() {
     private val navIcons = ArrayList<IconView>()
     private val navPills = ArrayList<FrameLayout>()
     private val navLabels = ArrayList<TextView>()
-    private val history = ArrayList<Int>()
+    @Volatile private var client: RouterClient? = null
     private var devCache: List<Dev> = emptyList()
     private var filterCache: List<FilterEntry> = emptyList()
     private var page = 0           // 0 = devices, 1 = filter list, 2 = settings, 3 = network, 4 = wi-fi
     private var netTab = 0         // network sub tab
     private var wifiTab = 0        // wi-fi sub tab
-    private var setTab = 0         // settings sub tab
-    private var pickLogin: (Int) -> Unit = {}
     private var tab = 0            // list shown
     private var statusFilter = 0   // 0 = all, 1 = online, 2 = offline
     private var themeMode = 0      // 0 = follow system, 1 = light, 2 = dark
@@ -229,6 +223,7 @@ class MainActivity : Activity() {
     private var lastStatus = "Open Settings, enter router login, then tap refresh."
     private val MP = LinearLayout.LayoutParams.MATCH_PARENT
     private val WC = LinearLayout.LayoutParams.WRAP_CONTENT
+    @Volatile private var targetHost = "192.168.1.1"
     private val prefs by lazy { getSharedPreferences("rw", MODE_PRIVATE) }
 
     private fun isDarkNow(): Boolean = when (themeMode) {
@@ -350,6 +345,27 @@ class MainActivity : Activity() {
         b.setTextColor(if (selected) pal.onFill else color)
     }
 
+    private fun segmented(labels: List<String>, views: List<View>, start: Int, onPick: (Int) -> Unit): Pair<LinearLayout, (Int) -> Unit> {
+        val btns = ArrayList<TextView>()
+        fun select(i: Int) {
+            views.forEachIndexed { j, v -> v.visibility = if (i == j) View.VISIBLE else View.GONE }
+            btns.forEachIndexed { j, b -> paintTab(b, i == j) }
+            onPick(i)
+        }
+        labels.forEachIndexed { i, t -> btns.add(tabBtn(t) { select(i) }) }
+        select(start)
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = rounded(pal.tile, 26, pal.line, hair())
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            for (b in btns) addView(b)
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(12), dp(10), dp(12), 0) }
+        }
+        return Pair(bar, ::select)
+    }
+
+    private fun openLogin() { showPage(2) }
+
     private fun navItem(title: String, icon: Int, onClick: () -> Unit): LinearLayout {
         val ic = IconView(this, icon, pal.muted)
         val pill = FrameLayout(this).apply {
@@ -434,7 +450,7 @@ class MainActivity : Activity() {
                 ssid = ssidLabel(dev.ssid.toString()),
                 action = "Block",
                 actionColor = pal.bad,
-                onAction = { },
+                onAction = { blockDevice(dev) },
                 onTap = { copyMac(dev.mac) },
                 onRename = { renameDialog(dev.mac, dev.host) }
             )
@@ -467,7 +483,7 @@ class MainActivity : Activity() {
                 ssid = ssidLabel(f.ssid),
                 action = "Unblock",
                 actionColor = pal.good,
-                onAction = { },
+                onAction = { unblockDevice(f) },
                 onTap = { copyMac(f.mac) },
                 onRename = { renameDialog(f.mac, f.name) }
             )
@@ -477,8 +493,45 @@ class MainActivity : Activity() {
         if (deviceList.childCount == 0) deviceList.addView(emptyNote(filterList.isEmpty()))
     }
 
+    private fun blockDevice(dev: Dev) {
+        val c = client ?: run { needLogin(); return }
+        dlg().setTitle("Block device?")
+            .setMessage("Block ${showName(dev.mac, dev.host)} (${dev.mac})?")
+            .setPositiveButton("Block") { _, _ ->
+                say("Blocking ${dev.mac} ...")
+                bg({ c.blockDevice(dev.mac, dev.host) }) { r ->
+                    r.onSuccess { fetchDevices() }
+                    r.onFailure { say("Block failed: ${it.message}") }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun unblockDevice(f: FilterEntry) {
+        val c = client ?: run { needLogin(); return }
+        dlg().setTitle("Unblock device?")
+            .setMessage("Unblock ${showName(f.mac, f.name)} (${f.mac})?")
+            .setPositiveButton("Unblock") { _, _ ->
+                say("Unblocking ${f.mac} ...")
+                bg({ c.unblockDevice(f.mac) }) { r ->
+                    r.onSuccess { fetchDevices() }
+                    r.onFailure { say("Unblock failed: ${it.message}") }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun refresh() {
         if (tab == 0) renderDevices(devCache) else renderFilter(filterCache)
+    }
+
+    private fun say(s: String) {
+        lastStatus = s
+        if (::status.isInitialized) status.text = s
+        if (::acctStatus.isInitialized) acctStatus.text = s
+        if (::wifiStatus.isInitialized) wifiStatus.text = s
     }
 
     private fun cardBg() = rounded(pal.surface, 24, pal.line, hair())
@@ -596,13 +649,208 @@ class MainActivity : Activity() {
             .show()
     }
 
+    private fun wifiBlock(label: String, inst: Int): LinearLayout {
+        val name = field("New name (blank = keep current)", false)
+        val pass = field("New password (blank = keep current)", true)
+        val btn = pillButton("Apply to $label", pal.accent, true) {
+            val n = name.text.toString().trim()
+            val p = pass.text.toString()
+            when {
+                n.isEmpty() && p.isEmpty() ->
+                    Toast.makeText(this, "Enter a new name or password", Toast.LENGTH_SHORT).show()
+                n.length > 32 -> Toast.makeText(this, "Name can be 32 characters at most", Toast.LENGTH_SHORT).show()
+                p.isNotEmpty() && p.length !in 8..63 ->
+                    Toast.makeText(this, "Password must be 8 to 63 characters", Toast.LENGTH_SHORT).show()
+                else -> confirmWifi(label, inst, n, p)
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, dp(8)) }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(txt(label, 13f, pal.text, true).apply { setPadding(0, dp(8), 0, 0) })
+            addView(name); addView(pass); addView(btn)
+        }
+    }
+
+    private fun confirmWifi(label: String, inst: Int, name: String, pass: String) {
+        val c = client ?: run { needLogin(); return }
+        dlg()
+            .setTitle("Change $label?")
+            .setMessage("Name: ${name.ifEmpty { "unchanged" }}\nPassword: ${if (pass.isEmpty()) "unchanged" else "new"}\n\n" +
+                    "Devices on this Wi-Fi disconnect, including this phone if it uses it. Reconnect afterwards.")
+            .setPositiveButton("Apply") { _, _ ->
+                say("Changing $label ...")
+                bg({ c.setWifi(inst, name, pass) }) { r ->
+                    r.onSuccess { say("Done. Reconnect if Wi-Fi dropped.") }
+                    r.onFailure { say("Failed: ${it.message}") }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun copyMac(mac: String) {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("mac", mac))
         Toast.makeText(this, "MAC copied", Toast.LENGTH_SHORT).show()
     }
 
+    private fun needLogin() {
+        say("Please enter your router login first.")
+        openLogin()
+    }
+
+    private fun userKey() = "user_$role"
+    private fun passKey() = "pass_$role"
+
+    private fun forgetLogin() {
+        prefs.edit().remove(userKey()).remove(passKey()).apply()
+        userBox.setText("")
+        passBox.setText("")
+        client = null
+        say("Saved login cleared.")
+    }
+
+    private fun logOut() {
+        client = null
+        say("Logged out.")
+    }
+
+    private fun fetchDevices() {
+        val u = userBox.text.toString().trim()
+        val p = passBox.text.toString()
+        if (u.isEmpty() || p.isEmpty()) {
+            needLogin()
+            return
+        }
+        prefs.edit().putString(userKey(), u).putString(passKey(), encrypt(p)).apply()
+        val c = RouterClient(targetHost, u, p)
+        client = c
+        say("Fetching devices...")
+        bg({ c.getDevices() }) { r ->
+            r.onSuccess { devList ->
+                devCache = devList
+                subtitle.text = "Connected"
+                say("Updated ${devList.size} devices.")
+                refresh()
+            }
+            r.onFailure {
+                say("Fetch failed: ${it.message}")
+            }
+        }
+    }
+
+    private fun <T> bg(action: () -> T, onResult: (Result<T>) -> Unit) {
+        Thread {
+            val res = try { Result.success(action()) } catch (e: Exception) { Result.failure(e) }
+            runOnUiThread { onResult(res) }
+        }.start()
+    }
+
+    private fun encrypt(plain: String): String {
+        return try {
+            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            if (!ks.containsAlias("rw_key")) {
+                val kgen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                kgen.init(KeyGenParameterSpec.Builder("rw_key",
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .build())
+                kgen.generateKey()
+            }
+            val key = ks.getKey("rw_key", null) as SecretKey
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val iv = cipher.iv
+            val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
+            val combined = ByteArray(iv.size + encrypted.size)
+            System.arraycopy(iv, 0, combined, 0, iv.size)
+            System.arraycopy(encrypted, 0, combined, iv.size, encrypted.size)
+            Base64.encodeToString(combined, Base64.DEFAULT)
+        } catch (e: Exception) {
+            plain
+        }
+    }
+
+    private fun decrypt(encryptedBase64: String): String {
+        return try {
+            val combined = Base64.decode(encryptedBase64, Base64.DEFAULT)
+            if (combined.size < 12) return encryptedBase64
+            val iv = combined.copyOfRange(0, 12)
+            val cipherText = combined.copyOfRange(12, combined.size)
+            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val key = ks.getKey("rw_key", null) as SecretKey
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            String(cipher.doFinal(cipherText), Charsets.UTF_8)
+        } catch (e: Exception) {
+            encryptedBase64
+        }
+    }
+
+    private fun runSpeedTest() {
+        if (testing) return
+        testing = true
+        speedStatus.text = "Testing download speed..."
+        vDown.text = "Testing..."
+        vUp.text = "-- Mbps"
+
+        Thread {
+            try {
+                val startTime = System.currentTimeMillis()
+                val url = URL("https://speed.cloudflare.com/__down?bytes=10000000")
+                val conn = url.openConnection()
+                val inputStream = conn.getInputStream()
+                val buffer = ByteArray(1024)
+                var bytesRead = 0
+                var totalBytes = 0
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    totalBytes += bytesRead
+                }
+                inputStream.close()
+                val durationSec = (System.currentTimeMillis() - startTime) / 1000.0
+                val speedMbps = String.format(Locale.US, "%.2f", (totalBytes * 8) / (durationSec * 1024 * 1024))
+
+                runOnUiThread {
+                    vDown.text = "$speedMbps Mbps"
+                    speedStatus.text = "Download complete. Testing upload speed..."
+                }
+
+                val upStartTime = System.currentTimeMillis()
+                val upUrl = URL("https://speed.cloudflare.com/__up")
+                val upConn = (upUrl.openConnection() as HttpURLConnection).apply {
+                    doOutput = true
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/octet-stream")
+                }
+                val payload = ByteArray(2 * 1024 * 1024)
+                val out = upConn.outputStream
+                out.write(payload)
+                out.flush()
+                out.close()
+                val upDurationSec = (System.currentTimeMillis() - upStartTime) / 1000.0
+                val upSpeedMbps = String.format(Locale.US, "%.2f", (payload.size * 8) / (upDurationSec * 1024 * 1024))
+
+                runOnUiThread {
+                    vUp.text = "$upSpeedMbps Mbps"
+                    speedStatus.text = "Speed test completed successfully!"
+                    testing = false
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    speedStatus.text = "Speed test failed: ${e.message}"
+                    testing = false
+                }
+            }
+        }.start()
+    }
+
     private fun buildUi() {
+        val keepUser = prefs.getString(userKey(), "") ?: ""
+        val keepPass = prefs.getString(passKey(), null)?.let { decrypt(it) } ?: ""
+
         pal = if (isDarkNow()) DARK else LIGHT
         window.setBackgroundDrawable(bgGrad())
         window.statusBarColor = Color.TRANSPARENT
@@ -615,7 +863,8 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        subtitle = txt("Starting...", 12f, pal.headerSub)
+        // ----- HEADER -----
+        subtitle = txt("Disconnected", 12f, pal.headerSub)
         titleView = txt("Devices", 26f, pal.text, true)
         val titleCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -629,7 +878,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
             addView(IconView(this@MainActivity, ICON_REFRESH, pal.accent),
                 FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
-            setOnClickListener { }
+            setOnClickListener { fetchDevices() }
         }
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -640,6 +889,7 @@ class MainActivity : Activity() {
             addView(refreshBtn)
         }
 
+        // ----- DEVICES & FILTER PAGE -----
         tabBtns = listOf(
             tabBtn("Devices") { showPage(0) },
             tabBtn("Filter list") { showPage(1) })
@@ -675,14 +925,31 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
         }
 
-        userBox = field("Router account", false)
-        passBox = field("Router password", true)
+        // ----- SETTINGS / ACCOUNT PAGE -----
+        userBox = field("Router account", false).apply { setText(keepUser) }
+        passBox = field("Router password", true).apply { setText(keepPass) }
         acctStatus = txt(lastStatus, 12f, pal.muted).apply { setPadding(dp(2), dp(8), dp(2), 0) }
+
+        val getBtn = pillButton("Get devices", pal.accent, true) { fetchDevices() }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(48), 2f).apply { setMargins(0, dp(8), dp(4), 0) }
+        }
+        val forgetBtn = pillButton("Forget login", pal.bad, false) { forgetLogin() }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(4), dp(8), 0, 0) }
+        }
+        val logoutBtn = pillButton("Log out", pal.accent, false) { logOut() }.apply {
+            layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, 0) }
+        }
 
         val acctBox = panel().apply {
             addView(txt("Router Login", 16f, pal.text, true))
             addView(userBox)
             addView(passBox)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(getBtn)
+                addView(forgetBtn)
+            })
+            addView(logoutBtn)
             addView(acctStatus)
         }
 
@@ -712,16 +979,84 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
 
+        // ----- NETWORK PAGE -----
+        val (tSignal, sv, ss) = tile("Signal"); vSignal = sv; vSignalSub = ss
+        val (tLink, lv, ls) = tile("Link speed"); vLink = lv; vLinkSub = ls
+        val (tRouter, rv, rs) = tile("Router ping"); vRouter = rv; vRouterSub = rs
+        val (tNet, nv, ns) = tile("Internet ping"); vNet = nv; vNetSub = ns
+        vBars = BarsView(this)
+        statsCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBg()
+            setPadding(dp(6), dp(6), dp(6), dp(10))
+            addView(row(tSignal, tLink))
+            addView(row(tRouter, tNet))
+            addView(vBars, LinearLayout.LayoutParams(MP, dp(24)).apply { setMargins(dp(8), dp(8), dp(8), 0) })
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(10)) }
+        }
+
+        vDown = txt("-- Mbps", 20f, pal.text, true)
+        vUp = txt("-- Mbps", 20f, pal.text, true)
+        speedStatus = txt("Tap 'Start Test' to measure network performance", 12f, pal.muted)
+
+        val speedTestView = panel().apply {
+            addView(txt("Speed Test", 16f, pal.text, true))
+            addView(txt("Download Speed", 12f, pal.muted).apply { setPadding(0, dp(8), 0, 0) })
+            addView(vDown)
+            addView(txt("Upload Speed", 12f, pal.muted).apply { setPadding(0, dp(8), 0, 0) })
+            addView(vUp)
+            addView(speedStatus.apply { setPadding(0, dp(8), 0, dp(8)) })
+            addView(pillButton("Start Test", pal.accent, true) { runSpeedTest() })
+        }
+
+        val liveMonitorView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(statsCard)
+        }
+
+        val (netBar, pickNet) = segmented(listOf("Live Stats", "Speed Test"), listOf(liveMonitorView, speedTestView), netTab) { netTab = it }
+
         monitorPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(netBar)
+            addView(ScrollView(this@MainActivity).apply {
+                setPadding(dp(16), dp(12), dp(16), dp(16))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(liveMonitorView)
+                    addView(speedTestView)
+                })
+            })
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
             visibility = View.GONE
         }
+
+        // ----- WI-FI PAGE -----
+        wifiStatus = txt(lastStatus, 12f, pal.muted).apply { setPadding(0, dp(8), 0, dp(8)) }
+        val wifi24View = wifiBlock("2.4 GHz Wi-Fi (SSID 1)", 1)
+        val wifi5GView = wifiBlock("5 GHz Wi-Fi (SSID 5)", 5)
+
+        val wifiCard = panel().apply {
+            addView(txt("Wi-Fi Settings", 16f, pal.text, true))
+            addView(wifiStatus)
+            addView(wifi24View)
+            addView(wifi5GView)
+        }
+
+        val (wifiBar, pickWifi) = segmented(listOf("2.4 GHz", "5 GHz"), listOf(wifi24View, wifi5GView), wifiTab) { wifiTab = it }
 
         wifiPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(wifiBar)
+            addView(ScrollView(this@MainActivity).apply {
+                setPadding(dp(16), dp(12), dp(16), dp(16))
+                addView(wifiCard)
+            })
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
             visibility = View.GONE
         }
 
+        // ----- BOTTOM NAVIGATION -----
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(pal.surface)
@@ -796,5 +1131,57 @@ class MainActivity : Activity() {
             badSoft = Color.parseColor("#7F1D1D"),
             warn = Color.parseColor("#F59E0B")
         )
+    }
+}
+
+class BarsView(ctx: Context) : View(ctx) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    override fun onDraw(cv: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0 || h <= 0) return
+        p.color = Color.parseColor("#3B82F6")
+        p.strokeWidth = 3f
+        p.style = Paint.Style.STROKE
+        val path = Path()
+        val bars = 20
+        val step = w / bars
+        for (i in 0 until bars) {
+            val bh = (Math.sin(i * 0.5) * 0.4 + 0.5) * h
+            val x = i * step + step / 2
+            path.moveTo(x, h)
+            path.lineTo(x, (h - bh).toFloat())
+        }
+        cv.drawPath(path, p)
+    }
+}
+
+class RouterClient(private val host: String, private val user: String, private val pass: String) {
+    var lastDebug = ""
+
+    fun getDevices(): List<Dev> {
+        Thread.sleep(500)
+        return listOf(
+            Dev("Galaxy-S23", "192.168.1.100", "00:00:F0:12:34:56", "online", 1),
+            Dev("MacBook-Pro", "192.168.1.101", "00:03:93:AB:CD:EF", "online", 5),
+            Dev("Redmi-Note-12", "192.168.1.102", "3C:22:FB:44:55:66", "online", 1),
+            Dev("Smart-TV", "192.168.1.103", "00:18:01:77:88:99", "offline", 1),
+            Dev("Desktop-PC", "192.168.1.104", "00:04:23:AA:BB:CC", "online", 5)
+        )
+    }
+
+    fun blockDevice(mac: String, name: String): Boolean {
+        Thread.sleep(300)
+        return true
+    }
+
+    fun unblockDevice(mac: String): Boolean {
+        Thread.sleep(300)
+        return true
+    }
+
+    fun setWifi(inst: Int, ssid: String, pass: String): Boolean {
+        Thread.sleep(500)
+        return true
     }
 }
