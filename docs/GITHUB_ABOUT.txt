@@ -1,8 +1,0 @@
-Description (paste in repo "About" box, max 350 chars):
-Android app to monitor Wi-Fi signal, link speed and ping, list connected devices, and manage the WLAN MAC filter (whitelist) of a Huawei HG8145V5 router from your phone.
-
-Website: (leave empty or use release page)
-https://github.com/j4eh1/RouterWatch/releases
-
-Topics:
-android, kotlin, router, wifi, network-monitor, mac-filter, whitelist, huawei, hg8145v5, network-tools

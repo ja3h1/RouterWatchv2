@@ -1291,9 +1291,19 @@ class MainActivity : Activity() {
             if (!seen.add(mac.lowercase())) continue
             val ip = strs.firstOrNull { ipRe.matches(it) } ?: ""
             val st = strs.firstOrNull { it.equals("online", true) || it.equals("offline", true) } ?: ""
-            val host = strs.firstOrNull {
-                it.isNotBlank() && !macRe.matches(it) && !ipRe.matches(it) && !skipRe.matches(it)
-            } ?: ""
+            // Router JS args are positional. HostName = 10th arg (11th for USERDeviceNew),
+            // UserDevAlias = 15th (16th). Old guess picked DevType ("android-dhcp-11") instead.
+            val off = if (m.value.contains("USERDeviceNew")) 1 else 0
+            val alias = strs.getOrNull(14 + off)?.trim().orEmpty()
+            val hostName = strs.getOrNull(9 + off)?.trim().orEmpty()
+            val host = when {
+                alias.isNotBlank() && alias != "--" -> alias
+                hostName.isNotBlank() && hostName != "--" -> hostName
+                strs.size <= 9 + off -> strs.firstOrNull {
+                    it.isNotBlank() && !macRe.matches(it) && !ipRe.matches(it) && !skipRe.matches(it)
+                } ?: ""
+                else -> ""
+            }
             val ssid = strs.firstNotNullOfOrNull {
                 Regex("^SSID[-_ ]?(\\d+)$", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull()
             } ?: 1
