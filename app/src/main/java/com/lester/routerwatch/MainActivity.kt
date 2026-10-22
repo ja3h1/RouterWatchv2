@@ -661,6 +661,9 @@ class MainActivity : Activity() {
         val forgetBtn = pillButton("Forget login", pal.bad, false) { forgetLogin() }.apply {
             layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(4), dp(8), 0, 0) }
         }
+        val logoutBtn = pillButton("Log out", pal.accent, false) { logOut() }.apply {
+            layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, 0) }
+        }
         roleBtns = listOf("Normal admin", "Super admin").mapIndexed { i, t -> tabBtn(t) { setRole(i) } }
         val roleBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -677,6 +680,7 @@ class MainActivity : Activity() {
             addView(userBox)
             addView(passBox)
             addView(row(getBtn, forgetBtn))
+            addView(logoutBtn)
             addView(acctStatus)
         }
         themeBtns = listOf("System", "Light", "Dark").mapIndexed { i, t -> tabBtn(t) { setThemeMode(i) } }
@@ -827,6 +831,18 @@ class MainActivity : Activity() {
         passBox.setText(prefs.getString(passKey(), null)?.let { decrypt(it) } ?: "")
         roleBtns.forEachIndexed { i, b -> paintTab(b, role == i) }
         say("${if (r == 1) "Super admin" else "Normal admin"}: tap Get devices to log in.")
+    }
+
+    // End the router session and clear loaded data. Saved login stays (use Forget login to erase it).
+    private fun logOut() {
+        val c = client
+        client = null
+        devCache = emptyList()
+        filterCache = emptyList()
+        wlEnabled = null
+        if (c != null) Thread { c.logout() }.start()
+        say("Logged out. Tap Get devices to log in again.")
+        showPage(2)
     }
 
     private fun forgetLogin() {
@@ -1244,6 +1260,12 @@ class MainActivity : Activity() {
                 } catch (e: Exception) { }
             }
             return emptyList()
+        }
+
+        // Frees the router's admin session slot. Endpoint is assumed (Huawei web UI style); errors ignored.
+        fun logout() {
+            try { post("/logout.cgi?RequestFile=html/logout.html", "x.X_HW_Token=" + enc(cfgToken())) }
+            catch (e: Exception) { }
         }
 
         // ---- config writes need a fresh token per request ----
