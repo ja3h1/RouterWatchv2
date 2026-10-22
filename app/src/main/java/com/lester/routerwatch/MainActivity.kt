@@ -1298,8 +1298,8 @@ class MainActivity : Activity() {
         }
 
         // Some Huawei firmware uses the token printed inside the page itself.
-        private fun pageToken(): String? = try {
-            val html = read(open(FILTER_PAGE, false))
+        private fun pageToken(page: String = FILTER_PAGE): String? = try {
+            val html = read(open(page, false))
             val tag = Regex("<input[^>]*token[^>]*>", RegexOption.IGNORE_CASE).findAll(html)
                 .mapNotNull { Regex("value\\s*=\\s*[\"']([0-9a-fA-F]{16,})").find(it.value)?.groupValues?.get(1) }
                 .firstOrNull()
@@ -1432,7 +1432,30 @@ class MainActivity : Activity() {
             try {
                 val n = enc(ssid)
                 val p = enc(pass.ifEmpty { currentWifiKey() })
-                val body = "y.Enable=1&y.SSIDAdvertisementEnabled=1&y.SSID=$n&y.X_HW_AssociateNum=10" +
+                // This page's own Apply button sends the token printed in the page (hidden "onttoken").
+                // Try that first, then the ajax token. A wrong token is ignored silently by the router,
+                // so after each try read the name back and only stop when it really changed.
+                for (kind in 0..1) {
+                    val t = (if (kind == 0) pageToken(WLAN_PAGE) else cfgToken()) ?: continue
+                    post(url, wifiBody(n, p, t))
+                    Thread.sleep(2000)
+                    // read fails when Wi-Fi restarted and the phone dropped off: treat as applied
+                    val now = try { currentSsid() } catch (e: Exception) { return }
+                    if (now == ssid) return
+                }
+                throw Exception("Router ignored the change (name is still \"${currentSsid()}\")")
+            } finally { referer = null }
+        }
+
+        private fun currentSsid(): String {
+            val html = read(open(WLAN_PAGE, false))
+            val m = Regex("""new stWlan\("[^"]*WLANConfiguration\\x2e1","[^"]*","[^"]*","([^"]*)""").find(html)
+                ?: throw Exception("Cannot read the current Wi-Fi name from the router page.")
+            return unescape(m.groupValues[1])
+        }
+
+        private fun wifiBody(n: String, p: String, token: String): String =
+            "y.Enable=1&y.SSIDAdvertisementEnabled=1&y.SSID=$n&y.X_HW_AssociateNum=10" +
                         "&y.BeaconType=11i&y.IEEE11iAuthenticationMode=PSKAuthentication" +
                         "&y.IEEE11iEncryptionModes=AESEncryption&k.PreSharedKey=$p&y.X_HW_GroupRekey=3600" +
                         "&z.Enable=0&z.X_HW_ConfigMethod=PushButton&w.SsidInst=1&w.SSID=$n&w.Enable=1" +
@@ -1441,10 +1464,7 @@ class MainActivity : Activity() {
                         "&w.IEEE11iAuthenticationMode=PSKAuthentication&w.IEEE11iEncryptionModes=AESEncryption" +
                         "&w.MixAuthenticationMode=EAPAuthentication&w.MixEncryptionModes=AESEncryption" +
                         "&w.SSIDAdvertisementEnabled=1&w.WMMEnable=1&w.MaxAssociateNum=10&w.BeaconType=11i" +
-                        "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(cfgToken())}"
-                post(url, body)
-            } finally { referer = null }
-        }
+                        "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(token)}"
     }
 
     private fun parseFilter(text: String): List<FilterEntry> {
