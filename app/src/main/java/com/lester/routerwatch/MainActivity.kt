@@ -176,8 +176,6 @@ class MainActivity : Activity() {
     private var themeMode = 0      // 0 = follow system, 1 = light, 2 = dark
     private var role = 0           // 0 = normal admin, 1 = super admin (own saved login each)
     private lateinit var roleBtns: List<TextView>
-    private fun userKey() = if (role == 1) "user_su" else "user"
-    private fun passKey() = if (role == 1) "pass_su" else "pass"
     private var pal: Pal = LIGHT
     private var lastStatus = "Open Account, enter router login, then tap refresh."
     private val MP = LinearLayout.LayoutParams.MATCH_PARENT
@@ -499,20 +497,22 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ---------- change Wi-Fi name / password (band steering: SSID1 drives 2.4G + 5G) ----------
-    // Password blank = change the name only, current password is kept.
-    private fun wifiBlock(label: String): LinearLayout {
-        val name = field("Wi-Fi name", false)
+    // ---------- change Wi-Fi name / password ----------
+    // Blank name = change the password only. Blank password = change the name only.
+    // 2.4G and 5G are separate: SSID1 = 2.4G, SSID5 = 5G.
+    private fun wifiBlock(label: String, inst: Int): LinearLayout {
+        val name = field("New name (blank = keep current)", false)
         val pass = field("New password (blank = keep current)", true)
         val btn = pillButton("Apply to $label", pal.accent, true) {
             val n = name.text.toString().trim()
             val p = pass.text.toString()
             when {
-                n.isEmpty() -> Toast.makeText(this, "Enter the Wi-Fi name", Toast.LENGTH_SHORT).show()
+                n.isEmpty() && p.isEmpty() ->
+                    Toast.makeText(this, "Enter a new name or password", Toast.LENGTH_SHORT).show()
                 n.length > 32 -> Toast.makeText(this, "Name can be 32 characters at most", Toast.LENGTH_SHORT).show()
                 p.isNotEmpty() && p.length !in 8..63 ->
                     Toast.makeText(this, "Password must be 8 to 63 characters", Toast.LENGTH_SHORT).show()
-                else -> confirmWifi(label, n, p)
+                else -> confirmWifi(label, inst, n, p)
             }
         }.apply {
             layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, dp(8)) }
@@ -524,18 +524,16 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun confirmWifi(label: String, name: String, pass: String) {
+    private fun confirmWifi(label: String, inst: Int, name: String, pass: String) {
         val c = client ?: run { needLogin(); return }
-        val same = pass.isEmpty()
         dlg()
             .setTitle("Change $label?")
-            .setMessage("New name: $name\n" + (if (same) "Password: stays the same\n" else "") +
-                    "\nDevices on this Wi-Fi disconnect, including this phone if it uses it. " +
-                    (if (same) "Reconnect with the new name." else "Reconnect with the new name and password."))
+            .setMessage("Name: ${name.ifEmpty { "unchanged" }}\nPassword: ${if (pass.isEmpty()) "unchanged" else "new"}\n\n" +
+                    "Devices on this Wi-Fi disconnect, including this phone if it uses it. Reconnect afterwards.")
             .setPositiveButton("Apply") { _, _ ->
                 say("Changing $label ...")
-                bg({ c.setWifi(name, pass) }) { r ->
-                    r.onSuccess { say("Sent. Reconnect to \"$name\" if Wi-Fi dropped.") }
+                bg({ c.setWifi(inst, name, pass) }) { r ->
+                    r.onSuccess { say("Done. Reconnect if Wi-Fi dropped.") }
                     r.onFailure {
                         say("Failed: ${it.message}. Wi-Fi may have restarted anyway.")
                         showDebug("Wi-Fi change - copy and send this", c.lastDebug + "\n" + (it.message ?: ""))
@@ -708,9 +706,10 @@ class MainActivity : Activity() {
         }
         val wifiCard = panel().apply {
             addView(txt("Wi-Fi name and password", 15f, pal.text, true))
-            addView(txt("Needs router login. Leave password blank to change only the name. " +
-                    "Band steering: one name and password for 2.4G and 5G.", 12f, pal.muted))
-            addView(wifiBlock("Wi-Fi (2.4G + 5G)"))
+            addView(txt("Needs router login. 2.4G and 5G are changed separately. " +
+                    "Leave the name or the password blank to change only the other one.", 12f, pal.muted))
+            addView(wifiBlock("2.4 GHz", 1))
+            addView(wifiBlock("5 GHz", 5))
         }
         val acctCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -774,6 +773,10 @@ class MainActivity : Activity() {
     }
 
     // ---------- saved login (password encrypted with Android Keystore) ----------
+    // one saved login per role: 0 = normal admin, 1 = super admin
+    private fun userKey() = if (role == 1) "user_super" else "user"
+    private fun passKey() = if (role == 1) "pass_super" else "pass"
+
     private fun secretKey(): SecretKey {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (ks.getKey("rw_key", null) as? SecretKey)?.let { return it }
@@ -801,11 +804,20 @@ class MainActivity : Activity() {
     } catch (e: Exception) { null }
 
     private fun saveLogin(user: String, pass: String) {
+        val ed = prefs.edit().putString(userKey(), user)
         try {
-            prefs.edit().putString(userKey(), user).putString(passKey(), encrypt(pass)).apply()
+            ed.putString(passKey(), encrypt(pass))
         } catch (e: Exception) {
-            prefs.edit().putString(userKey(), user).remove(passKey()).apply()
+            try {
+                // stale Keystore key: drop it, make fresh one, retry once
+                KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry("rw_key")
+                ed.putString(passKey(), encrypt(pass))
+            } catch (e2: Exception) {
+                ed.remove(passKey())
+                Toast.makeText(this, "Password not saved: ${e2.message}", Toast.LENGTH_LONG).show()
+            }
         }
+        ed.apply()
     }
 
     private fun setRole(r: Int) {
@@ -1409,62 +1421,60 @@ class MainActivity : Activity() {
             }
         }
 
-        // Current 2.4G (SSID1) Wi-Fi password. The router's WlanBasic page prints it in plain text
-        // (wifiPasswordMask = 0) and its own Apply button resubmits it with every save, so we do the same.
-        private fun currentWifiKey(): String {
-            val html = read(open(WLAN_PAGE, false))
-            val m = Regex("""WLANConfiguration\\x2e1\\x2ePreSharedKey\\x2e1"\s*,\s*"([^"]*)""").find(html)
-            val key = m?.let { unescape(it.groupValues[1]) }.orEmpty()
-            if (key.isEmpty()) throw Exception("Cannot read the current Wi-Fi password from the router page.")
-            return key
-        }
+        // Name / key / radio mode of one SSID (1 = 2.4G, 5 = 5G). The router's WlanBasic page prints them
+        // in plain text (wifiPasswordMask = 0) and its own Apply button resubmits them with every save,
+        // so a name-only or password-only change just sends the other value back unchanged.
+        private fun wlanPage(): String = read(open(WLAN_PAGE, false))
 
-        // SSID1 (2.4G) name + password. Fields copied from a browser capture of the router's own
-        // page: it resubmits the whole form, so only SSID and key change, the rest stays as captured.
-        // Band steering shares one SSID/password, so this single request covers both bands.
-        // pass blank = name-only change: the current key is read from the router and sent back unchanged.
-        fun setWifi(ssid: String, pass: String) {
+        private fun keyOf(html: String, inst: Int): String? =
+            Regex("""WLANConfiguration\\x2e${inst}\\x2ePreSharedKey\\x2e1"\s*,\s*"([^"]*)""").find(html)
+                ?.let { unescape(it.groupValues[1]) }?.takeIf { it.isNotEmpty() }
+
+        private fun ssidOf(html: String, inst: Int): String? =
+            Regex("""new stWlan\("[^"]*WLANConfiguration\\x2e${inst}","[^"]*","[^"]*","([^"]*)""").find(html)
+                ?.let { unescape(it.groupValues[1]) }
+
+        private fun modeOf(html: String, inst: Int): String? =
+            Regex("""new stWlanWifi\("[^"]*WLANConfiguration\\x2e${inst}","[^"]*","[^"]*","[^"]*","([^"]*)""")
+                .find(html)?.groupValues?.get(1)
+
+        // inst: 1 = 2.4G, 5 = 5G. Blank ssidIn / passIn = keep the current one.
+        fun setWifi(inst: Int, ssidIn: String, passIn: String) {
             log.clear()
-            val y = "$WLAN_OBJ.1"
+            val html = wlanPage()
+            val ssid = ssidIn.ifEmpty { ssidOf(html, inst) ?: throw Exception("Cannot read the current Wi-Fi name.") }
+            val pass = passIn.ifEmpty { keyOf(html, inst) ?: throw Exception("Cannot read the current Wi-Fi password.") }
+            val mode = modeOf(html, inst) ?: if (inst == 1) "11bgn" else "11ac"
+            val y = "$WLAN_OBJ.$inst"
             val url = "$WLAN_SET?w=$WLAN_COVER&y=$y&z=$y.WPS&k=$y.PreSharedKey.1" +
                     "&RequestFile=${WLAN_PAGE.trimStart('/')}"
             referer = "https://$host$WLAN_PAGE"
             try {
-                val n = enc(ssid)
-                val p = enc(pass.ifEmpty { currentWifiKey() })
-                // This page's own Apply button sends the token printed in the page (hidden "onttoken").
-                // Try that first, then the ajax token. A wrong token is ignored silently by the router,
-                // so after each try read the name back and only stop when it really changed.
+                // The page's own Apply sends the token printed in the page (hidden "onttoken"); try it first,
+                // then the ajax token. A wrong token is ignored silently, so read the values back each time.
                 for (kind in 0..1) {
                     val t = (if (kind == 0) pageToken(WLAN_PAGE) else cfgToken()) ?: continue
-                    post(url, wifiBody(n, p, t))
+                    post(url, wifiBody(inst, enc(ssid), enc(pass), mode, t))
                     Thread.sleep(2000)
                     // read fails when Wi-Fi restarted and the phone dropped off: treat as applied
-                    val now = try { currentSsid() } catch (e: Exception) { return }
-                    if (now == ssid) return
+                    val now = try { wlanPage() } catch (e: Exception) { return }
+                    if (ssidOf(now, inst) == ssid && keyOf(now, inst) == pass) return
                 }
-                throw Exception("Router ignored the change (name is still \"${currentSsid()}\")")
+                throw Exception("Router ignored the change")
             } finally { referer = null }
         }
 
-        private fun currentSsid(): String {
-            val html = read(open(WLAN_PAGE, false))
-            val m = Regex("""new stWlan\("[^"]*WLANConfiguration\\x2e1","[^"]*","[^"]*","([^"]*)""").find(html)
-                ?: throw Exception("Cannot read the current Wi-Fi name from the router page.")
-            return unescape(m.groupValues[1])
-        }
-
-        private fun wifiBody(n: String, p: String, token: String): String =
+        private fun wifiBody(inst: Int, n: String, p: String, mode: String, token: String): String =
             "y.Enable=1&y.SSIDAdvertisementEnabled=1&y.SSID=$n&y.X_HW_AssociateNum=10" +
-                        "&y.BeaconType=11i&y.IEEE11iAuthenticationMode=PSKAuthentication" +
-                        "&y.IEEE11iEncryptionModes=AESEncryption&k.PreSharedKey=$p&y.X_HW_GroupRekey=3600" +
-                        "&z.Enable=0&z.X_HW_ConfigMethod=PushButton&w.SsidInst=1&w.SSID=$n&w.Enable=1" +
-                        "&w.Standard=11bgn&w.BasicAuthenticationMode=None&w.BasicEncryptionModes=AESEncryption" +
-                        "&w.WPAAuthenticationMode=EAPAuthentication&w.WPAEncryptionModes=AESEncryption" +
-                        "&w.IEEE11iAuthenticationMode=PSKAuthentication&w.IEEE11iEncryptionModes=AESEncryption" +
-                        "&w.MixAuthenticationMode=EAPAuthentication&w.MixEncryptionModes=AESEncryption" +
-                        "&w.SSIDAdvertisementEnabled=1&w.WMMEnable=1&w.MaxAssociateNum=10&w.BeaconType=11i" +
-                        "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(token)}"
+                    "&y.BeaconType=11i&y.IEEE11iAuthenticationMode=PSKAuthentication" +
+                    "&y.IEEE11iEncryptionModes=AESEncryption&k.PreSharedKey=$p&y.X_HW_GroupRekey=3600" +
+                    "&z.Enable=0&z.X_HW_ConfigMethod=PushButton&w.SsidInst=$inst&w.SSID=$n&w.Enable=1" +
+                    "&w.Standard=$mode&w.BasicAuthenticationMode=None&w.BasicEncryptionModes=AESEncryption" +
+                    "&w.WPAAuthenticationMode=EAPAuthentication&w.WPAEncryptionModes=AESEncryption" +
+                    "&w.IEEE11iAuthenticationMode=PSKAuthentication&w.IEEE11iEncryptionModes=AESEncryption" +
+                    "&w.MixAuthenticationMode=EAPAuthentication&w.MixEncryptionModes=AESEncryption" +
+                    "&w.SSIDAdvertisementEnabled=1&w.WMMEnable=1&w.MaxAssociateNum=10&w.BeaconType=11i" +
+                    "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(token)}"
     }
 
     private fun parseFilter(text: String): List<FilterEntry> {
