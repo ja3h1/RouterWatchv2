@@ -16,7 +16,6 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -74,6 +73,7 @@ const val ICON_DEVICES = 1
 const val ICON_SHIELD = 2
 const val ICON_GLOBE = 3
 const val ICON_PERSON = 4
+const val ICON_PULSE = 5
 
 /** Small line icons drawn with Canvas (24x24 grid, same shapes as the design). */
 class IconView(ctx: Context, private val kind: Int, tintColor: Int) : View(ctx) {
@@ -116,6 +116,11 @@ class IconView(ctx: Context, private val kind: Int, tintColor: Int) : View(ctx) 
                 path.moveTo(12f, 3f); path.cubicTo(9f, 6f, 9f, 18f, 12f, 21f)
                 cv.drawPath(path, p)
             }
+            ICON_PULSE -> {
+                path.moveTo(3f, 12f); path.lineTo(8f, 12f); path.lineTo(10.5f, 5f)
+                path.lineTo(13.5f, 19f); path.lineTo(16f, 12f); path.lineTo(21f, 12f)
+                cv.drawPath(path, p)
+            }
             else -> {
                 cv.drawCircle(12f, 8f, 4f, p)
                 path.moveTo(4f, 21f)
@@ -140,6 +145,11 @@ class MainActivity : Activity() {
     private lateinit var vNet: TextView
     private lateinit var vNetSub: TextView
     private lateinit var vBars: BarsView
+    private lateinit var vDown: TextView
+    private lateinit var vUp: TextView
+    private lateinit var speedStatus: TextView
+    private lateinit var monitorPage: ScrollView
+    @Volatile private var testing = false
     private lateinit var userBox: EditText
     private lateinit var passBox: EditText
     private lateinit var status: TextView
@@ -157,18 +167,23 @@ class MainActivity : Activity() {
     @Volatile private var client: RouterClient? = null
     private var devCache: List<Dev> = emptyList()
     private var filterCache: List<FilterEntry> = emptyList()
-    private var page = 0           // 0 = devices, 1 = filter list, 2 = account
+    private var page = 0           // 0 = devices, 1 = filter list, 2 = account, 3 = monitor
     private var tab = 0            // list shown: 0 = devices, 1 = filter list
     private var statusFilter = 0   // 0 = all, 1 = online, 2 = offline
     private var wlEnabled: Boolean? = null   // router WLAN filter on/off, null = unknown
     private var wlGuess = false              // true = value is only "last set by this app"
     private var wlError = ""                 // why the state could not be read
     private var themeMode = 0      // 0 = follow system, 1 = light, 2 = dark
+    private var role = 0           // 0 = normal admin, 1 = super admin (own saved login each)
+    private lateinit var roleBtns: List<TextView>
+    private fun userKey() = if (role == 1) "user_su" else "user"
+    private fun passKey() = if (role == 1) "pass_su" else "pass"
     private var pal: Pal = LIGHT
     private var lastStatus = "Open Account, enter router login, then tap refresh."
     private val MP = LinearLayout.LayoutParams.MATCH_PARENT
     private val WC = LinearLayout.LayoutParams.WRAP_CONTENT
     @Volatile private var running = false
+    @Volatile private var monitor: Thread? = null
     @Volatile private var targetHost = "192.168.1.1"
     @Volatile private var targetPort = 443
     private val prefs by lazy { getSharedPreferences("rw", MODE_PRIVATE) }
@@ -178,7 +193,7 @@ class MainActivity : Activity() {
         1 -> false
         2 -> true
         else -> (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
-            Configuration.UI_MODE_NIGHT_YES
+                Configuration.UI_MODE_NIGHT_YES
     }
 
     private fun setThemeMode(m: Int) {
@@ -228,7 +243,7 @@ class MainActivity : Activity() {
         val sub = txt("", 11f, pal.muted, true)
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = rounded(pal.tile, 12)
+            background = rounded(pal.tile, 18, pal.line, hair())
             setPadding(dp(12), dp(8), dp(12), dp(8))
             addView(txt(title, 11f, pal.muted))
             addView(value)
@@ -285,8 +300,10 @@ class MainActivity : Activity() {
     }
 
     private fun paintTab(b: TextView, selected: Boolean) {
-        b.background = ripple(rounded(if (selected) pal.accent else Color.TRANSPARENT, 22), 22)
-        b.setTextColor(if (selected) pal.onFill else pal.muted)
+        val thumb = if (pal.dark) Color.parseColor("#4DFFFFFF") else Color.WHITE
+        b.background = ripple(rounded(if (selected) thumb else Color.TRANSPARENT, 22,
+            if (selected) pal.line else 0, if (selected) hair() else 0), 22)
+        b.setTextColor(if (selected) pal.text else pal.muted)
     }
 
     private fun paintChip(b: TextView, selected: Boolean, color: Int) {
@@ -317,7 +334,7 @@ class MainActivity : Activity() {
 
     private fun paintNav() {
         for (i in navIcons.indices) {
-            val sel = when (i) { 0 -> page == 0; 1 -> page == 1; 3 -> page == 2; else -> false }
+            val sel = when (i) { 0 -> page == 0; 1 -> page == 1; 2 -> page == 3; 3 -> page == 2; else -> false }
             navPills[i].background = rounded(if (sel) pal.accentSoft else Color.TRANSPARENT, 15)
             navIcons[i].tint(if (sel) pal.accent else pal.muted)
             navLabels[i].setTextColor(if (sel) pal.accent else pal.muted)
@@ -334,13 +351,9 @@ class MainActivity : Activity() {
         if (p < 2) tab = p
         listPage.visibility = if (p < 2) View.VISIBLE else View.GONE
         accountPage.visibility = if (p == 2) View.VISIBLE else View.GONE
-        statsCard.visibility = if (p < 2) View.VISIBLE else View.GONE
+        monitorPage.visibility = if (p == 3) View.VISIBLE else View.GONE
         paintNav()
         if (p < 2) refresh()
-    }
-
-    private fun openRouterPage() {
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://$targetHost")))
     }
 
     // 1 = online, 2 = offline, 0 = unknown
@@ -372,20 +385,23 @@ class MainActivity : Activity() {
     }
 
     // ---------- cards ----------
-    private fun cardBg() = rounded(pal.surface, 16,
-        if (pal.dark) pal.line else 0, if (pal.dark) dp(1) else 0)
+    private fun cardBg() = rounded(pal.surface, 24, pal.line, hair())
+
+    private fun bgGrad() = GradientDrawable(GradientDrawable.Orientation.TL_BR,
+        if (pal.dark) GRAD_DARK else GRAD_LIGHT)
 
     private fun panel() = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         background = cardBg()
-        elevation = dp(2).toFloat()
+        elevation = 0f
         setPadding(dp(14), dp(12), dp(14), dp(12))
         layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(10)) }
     }
 
     private fun itemCard(
         name: String, sub: String, state: Int, ssid: String,
-        action: String, actionColor: Int, onAction: () -> Unit, onTap: (() -> Unit)?
+        action: String, actionColor: Int, onAction: () -> Unit, onTap: (() -> Unit)?,
+        onLong: (() -> Unit)? = null
     ): LinearLayout {
         val st = when (state) { 1 -> pal.good; 2 -> pal.bad; else -> pal.muted }
         val stSoft = when (state) { 1 -> pal.goodSoft; 2 -> pal.badSoft; else -> pal.tag }
@@ -439,12 +455,13 @@ class MainActivity : Activity() {
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = if (onTap != null) ripple(cardBg(), 16) else cardBg()
-            elevation = dp(2).toFloat()
+            background = if (onTap != null || onLong != null) ripple(cardBg(), 24) else cardBg()
+            elevation = 0f
             setPadding(dp(14), dp(12), dp(14), dp(12))
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(8)) }
             addView(top); addView(bottom)
             if (onTap != null) setOnClickListener { onTap() }
+            if (onLong != null) setOnLongClickListener { onLong(); true }
         }
     }
 
@@ -454,6 +471,80 @@ class MainActivity : Activity() {
 
     private fun ssidLabel(s: String) =
         if (s.isBlank()) "SSID --" else if (s.startsWith("SSID", true)) s else "SSID-$s"
+
+    // ---------- own device names (saved on this phone only) ----------
+    private fun nick(mac: String): String = prefs.getString("nick_" + mac.lowercase(), "") ?: ""
+    private fun showName(mac: String, routerName: String) = nick(mac).ifBlank { routerName }
+
+    private fun renameDialog(mac: String, routerName: String) {
+        val box = EditText(this).apply {
+            setSingleLine()
+            setText(nick(mac))
+            hint = routerName.ifBlank { "Device name" }
+        }
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(box)
+        }
+        dlg().setTitle("Name this device").setMessage(mac).setView(wrap)
+            .setPositiveButton("Save") { _, _ ->
+                prefs.edit().putString("nick_" + mac.lowercase(), box.text.toString().trim()).apply()
+                refresh()
+            }
+            .setNeutralButton("Reset") { _, _ ->
+                prefs.edit().remove("nick_" + mac.lowercase()).apply()
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---------- change Wi-Fi name / password (band steering: SSID1 drives 2.4G + 5G) ----------
+    // Password blank = change the name only, current password is kept.
+    private fun wifiBlock(label: String): LinearLayout {
+        val name = field("Wi-Fi name", false)
+        val pass = field("New password (blank = keep current)", true)
+        val btn = pillButton("Apply to $label", pal.accent, true) {
+            val n = name.text.toString().trim()
+            val p = pass.text.toString()
+            when {
+                n.isEmpty() -> Toast.makeText(this, "Enter the Wi-Fi name", Toast.LENGTH_SHORT).show()
+                n.length > 32 -> Toast.makeText(this, "Name can be 32 characters at most", Toast.LENGTH_SHORT).show()
+                p.isNotEmpty() && p.length !in 8..63 ->
+                    Toast.makeText(this, "Password must be 8 to 63 characters", Toast.LENGTH_SHORT).show()
+                else -> confirmWifi(label, n, p)
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, dp(8)) }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(txt(label, 13f, pal.text, true).apply { setPadding(0, dp(8), 0, 0) })
+            addView(name); addView(pass); addView(btn)
+        }
+    }
+
+    private fun confirmWifi(label: String, name: String, pass: String) {
+        val c = client ?: run { needLogin(); return }
+        val same = pass.isEmpty()
+        dlg()
+            .setTitle("Change $label?")
+            .setMessage("New name: $name\n" + (if (same) "Password: stays the same\n" else "") +
+                    "\nDevices on this Wi-Fi disconnect, including this phone if it uses it. " +
+                    (if (same) "Reconnect with the new name." else "Reconnect with the new name and password."))
+            .setPositiveButton("Apply") { _, _ ->
+                say("Changing $label ...")
+                bg({ c.setWifi(name, pass) }) { r ->
+                    r.onSuccess { say("Sent. Reconnect to \"$name\" if Wi-Fi dropped.") }
+                    r.onFailure {
+                        say("Failed: ${it.message}. Wi-Fi may have restarted anyway.")
+                        showDebug("Wi-Fi change - copy and send this", c.lastDebug + "\n" + (it.message ?: ""))
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
 
     private fun copyMac(mac: String) {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -465,21 +556,22 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     private fun buildUi() {
         val keepUser = if (::userBox.isInitialized) userBox.text.toString()
-            else (prefs.getString("user", "") ?: "")
+        else (prefs.getString(userKey(), "") ?: "")
         val keepPass = if (::passBox.isInitialized) passBox.text.toString()
-            else (prefs.getString("pass", null)?.let { decrypt(it) } ?: "")
+        else (prefs.getString(passKey(), null)?.let { decrypt(it) } ?: "")
 
         pal = if (isDarkNow()) DARK else LIGHT
-        window.setBackgroundDrawable(ColorDrawable(pal.bg))
-        window.statusBarColor = pal.statusBar
-        window.navigationBarColor = pal.surface
+        window.setBackgroundDrawable(bgGrad())
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
         window.decorView.systemUiVisibility =
-            if (!pal.dark && Build.VERSION.SDK_INT >= 26) View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR else 0
+            if (!pal.dark) View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
+                    (if (Build.VERSION.SDK_INT >= 26) View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR else 0)
+            else 0
         navIcons.clear(); navPills.clear(); navLabels.clear()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(pal.bg)
         }
 
         // ----- header -----
@@ -487,14 +579,14 @@ class MainActivity : Activity() {
         val titleCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-            addView(txt("RouterWatch", 20f, Color.WHITE, true))
+            addView(txt("RouterWatch", 26f, pal.text, true))
             addView(subtitle)
         }
         val refreshBtn = FrameLayout(this).apply {
             contentDescription = "Get devices"
-            background = ripple(oval(Color.parseColor("#33FFFFFF")), 22)
+            background = ripple(oval(pal.surface), 22)
             layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
-            addView(IconView(this@MainActivity, ICON_REFRESH, Color.WHITE),
+            addView(IconView(this@MainActivity, ICON_REFRESH, pal.accent),
                 FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             setOnClickListener { fetchDevices() }
         }
@@ -516,12 +608,12 @@ class MainActivity : Activity() {
         statsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = cardBg()
-            elevation = dp(2).toFloat()
+            elevation = 0f
             setPadding(dp(6), dp(6), dp(6), dp(10))
             addView(row(tSignal, tLink))
             addView(row(tRouter, tNet))
             addView(vBars, LinearLayout.LayoutParams(MP, dp(24)).apply { setMargins(dp(8), dp(8), dp(8), 0) })
-            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(12), dp(12), dp(12), 0) }
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(10)) }
         }
 
         // ----- list page: tabs, chips, status, list -----
@@ -530,8 +622,8 @@ class MainActivity : Activity() {
             tabBtn("Filter list") { openFilter() })
         val tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = rounded(pal.surface, 26, if (pal.dark) pal.line else 0, if (pal.dark) dp(1) else 0)
-            elevation = dp(2).toFloat()
+            background = rounded(pal.tile, 26, pal.line, hair())
+            elevation = 0f
             setPadding(dp(3), dp(3), dp(3), dp(3))
             addView(tabBtns[0]); addView(tabBtns[1])
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(12), dp(10), dp(12), 0) }
@@ -571,9 +663,19 @@ class MainActivity : Activity() {
         val forgetBtn = pillButton("Forget login", pal.bad, false) { forgetLogin() }.apply {
             layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(4), dp(8), 0, 0) }
         }
+        roleBtns = listOf("Normal admin", "Super admin").mapIndexed { i, t -> tabBtn(t) { setRole(i) } }
+        val roleBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = rounded(pal.tag, 26)
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            for (b in roleBtns) addView(b)
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, dp(8), 0, dp(4)) }
+        }
+        roleBtns.forEachIndexed { i, b -> paintTab(b, role == i) }
         val loginCard = panel().apply {
             addView(txt("Router login", 15f, pal.text, true))
             addView(txt("Used to read devices and edit the WLAN MAC filter.", 12f, pal.muted))
+            addView(roleBar)
             addView(userBox)
             addView(passBox)
             addView(row(getBtn, forgetBtn))
@@ -604,10 +706,17 @@ class MainActivity : Activity() {
                 setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL))) }
             })
         }
+        val wifiCard = panel().apply {
+            addView(txt("Wi-Fi name and password", 15f, pal.text, true))
+            addView(txt("Needs router login. Leave password blank to change only the name. " +
+                    "Band steering: one name and password for 2.4G and 5G.", 12f, pal.muted))
+            addView(wifiBlock("Wi-Fi (2.4G + 5G)"))
+        }
         val acctCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(12))
             addView(loginCard)
+            addView(wifiCard)
             addView(themeCard)
             addView(aboutCard)
         }
@@ -616,21 +725,47 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
         }
 
+        // ----- monitor page: live stats + speed test -----
+        val (tDown, dv, _) = tile("Download"); vDown = dv
+        val (tUp, uv, _) = tile("Upload"); vUp = uv
+        speedStatus = txt("Tap Start to test your internet speed.", 12f, pal.muted)
+            .apply { setPadding(dp(2), dp(8), dp(2), 0) }
+        val startBtn = pillButton("Start speed test", pal.accent, true) { runSpeedTest() }.apply {
+            layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, 0) }
+        }
+        val speedCard = panel().apply {
+            addView(txt("Speed test", 15f, pal.text, true))
+            addView(txt("Uses Cloudflare. About 28 MB of data per test.", 12f, pal.muted))
+            addView(row(tDown, tUp))
+            addView(startBtn)
+            addView(speedStatus)
+        }
+        val monCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            addView(statsCard)
+            addView(speedCard)
+        }
+        monitorPage = ScrollView(this).apply {
+            addView(monCol)
+            layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
+        }
+
         // ----- bottom nav -----
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(pal.surface)
+            background = rounded(pal.surface, 32, pal.line, hair())
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(16), dp(4), dp(16), dp(12)) }
             addView(navItem("Devices", ICON_DEVICES) { showPage(0) })
             addView(navItem("Filter list", ICON_SHIELD) { openFilter() })
-            addView(navItem("Router page", ICON_GLOBE) { openRouterPage() })
+            addView(navItem("Monitor", ICON_PULSE) { showPage(3) })
             addView(navItem("Account", ICON_PERSON) { showPage(2) })
         }
 
         root.addView(header)
-        root.addView(statsCard)
         root.addView(listPage)
         root.addView(accountPage)
-        root.addView(View(this).apply { setBackgroundColor(pal.line) }, LinearLayout.LayoutParams(MP, dp(1)))
+        root.addView(monitorPage)
         root.addView(nav)
         setContentView(root)
 
@@ -667,14 +802,23 @@ class MainActivity : Activity() {
 
     private fun saveLogin(user: String, pass: String) {
         try {
-            prefs.edit().putString("user", user).putString("pass", encrypt(pass)).apply()
+            prefs.edit().putString(userKey(), user).putString(passKey(), encrypt(pass)).apply()
         } catch (e: Exception) {
-            prefs.edit().putString("user", user).remove("pass").apply()
+            prefs.edit().putString(userKey(), user).remove(passKey()).apply()
         }
     }
 
+    private fun setRole(r: Int) {
+        role = r
+        prefs.edit().putInt("role", r).apply()
+        userBox.setText(prefs.getString(userKey(), "") ?: "")
+        passBox.setText(prefs.getString(passKey(), null)?.let { decrypt(it) } ?: "")
+        roleBtns.forEachIndexed { i, b -> paintTab(b, role == i) }
+        say("${if (r == 1) "Super admin" else "Normal admin"}: tap Get devices to log in.")
+    }
+
     private fun forgetLogin() {
-        prefs.edit().remove("user").remove("pass").apply()
+        prefs.edit().remove(userKey()).remove(passKey()).apply()
         userBox.setText("")
         passBox.setText("")
         client = null
@@ -691,6 +835,10 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         themeMode = prefs.getInt("theme", 0)
+        role = prefs.getInt("role", 0)
+        page = 2   // start on the login page
+        // QR feature removed: drop the Wi-Fi name/password it saved earlier
+        prefs.edit().remove("wifi_ssid").remove("wifi_pass").apply()
         buildUi()
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
@@ -705,7 +853,8 @@ class MainActivity : Activity() {
     }
 
     override fun onResume() { super.onResume(); startMonitor() }
-    override fun onPause() { running = false; super.onPause() }
+    // interrupt so the old thread leaves its 2 s sleep instead of surviving a quick resume
+    override fun onPause() { running = false; monitor?.interrupt(); super.onPause() }
 
     // ---------- device fetch ----------
     private fun fetchDevices() {
@@ -734,7 +883,7 @@ class MainActivity : Activity() {
                     saveLogin(user, pass)
                     say(if (list.isEmpty())
                         "Logged in, but no devices parsed. Page format may differ."
-                    else "${list.size} device(s). Tap card = copy MAC. Button = add to router filter.")
+                    else "${list.size} device(s). Tap = copy MAC. Long-press = rename. Button = add to filter.")
                     showPage(0)
                 }.onFailure { e ->
                     say("Failed: ${e.message}")
@@ -750,8 +899,9 @@ class MainActivity : Activity() {
         for (d in list.filter { passes(stateOfDev(it)) }) {
             val sub = listOf(d.ip, d.mac).filter { it.isNotBlank() }.joinToString(", ")
             deviceList.addView(itemCard(
-                d.host.ifBlank { "(unnamed device)" }, sub, stateOfDev(d), "SSID-${d.ssid}",
-                "Add to filter list", pal.accent, { addToFilter(d) }, { copyMac(d.mac) }))
+                showName(d.mac, d.host).ifBlank { "(unnamed device)" }, sub, stateOfDev(d), "SSID-${d.ssid}",
+                "Add to filter list", pal.accent, { addToFilter(d) }, { copyMac(d.mac) },
+                { renameDialog(d.mac, d.host) }))
         }
         if (deviceList.childCount == 0) deviceList.addView(emptyNote(list.isEmpty()))
     }
@@ -775,11 +925,11 @@ class MainActivity : Activity() {
 
     private fun addToFilter(d: Dev) {
         val c = client ?: run { needLogin(); return }
-        val name = d.host.ifBlank { "device" }.replace(Regex("[^A-Za-z0-9_.-]"), "-").take(31)
+        val name = showName(d.mac, d.host).ifBlank { "device" }.replace(Regex("[^A-Za-z0-9_.-]"), "-").take(31)
         dlg()
             .setTitle("Add to router filter?")
             .setMessage("$name\n${d.mac}  (SSID${d.ssid})\n\n" +
-                "Router mode decides meaning: whitelist = allowed, blacklist = blocked.")
+                    "Router mode decides meaning: whitelist = allowed, blacklist = blocked.")
             .setPositiveButton("Add") { _, _ ->
                 say("Adding ${d.mac} ...")
                 bg({
@@ -837,8 +987,8 @@ class MainActivity : Activity() {
         list.forEachIndexed { i, e ->
             if (!passes(st[i])) return@forEachIndexed
             deviceList.addView(itemCard(
-                e.name.ifBlank { "(no name)" }, e.mac, st[i], ssidLabel(e.ssid),
-                "Remove", pal.bad, { removeFromFilter(e) }, null))
+                showName(e.mac, e.name).ifBlank { "(no name)" }, e.mac, st[i], ssidLabel(e.ssid),
+                "Remove", pal.bad, { removeFromFilter(e) }, null, { renameDialog(e.mac, e.name) }))
         }
         if (deviceList.childCount == 0) deviceList.addView(emptyNote(list.isEmpty()))
         deviceList.addView(
@@ -896,7 +1046,7 @@ class MainActivity : Activity() {
                         val c = client
                         showDebug("Whitelist state - copy and send this",
                             "read error: ${wlError.ifBlank { "none (pattern not found)" }}\n\n" +
-                                (c?.modeSample?.ifBlank { "(no page sample yet, tap Check first)" } ?: "(not logged in)"))
+                                    (c?.modeSample?.ifBlank { "(no page sample yet, tap Check first)" } ?: "(not logged in)"))
                     }.apply { (layoutParams as LinearLayout.LayoutParams).setMargins(dp(8), 0, 0, 0) }
                 )
                 btns.layoutParams = LinearLayout.LayoutParams(WC, WC).apply { setMargins(0, dp(8), 0, 0) }
@@ -907,7 +1057,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = cardBg()
-            elevation = dp(2).toFloat()
+            elevation = 0f
             setPadding(dp(14), dp(12), dp(14), dp(12))
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(8)) }
             addView(col)
@@ -934,7 +1084,7 @@ class MainActivity : Activity() {
         dlg()
             .setTitle("Turn whitelist ON?")
             .setMessage("Only devices in the filter list can connect to Wi-Fi. " +
-                "Make sure this phone is in the list first, or you lose access.")
+                    "Make sure this phone is in the list first, or you lose access.")
             .setPositiveButton("Turn on") { _, _ -> applyWhitelist(c, true) }
             .setNegativeButton("Cancel") { _, _ -> refresh() }
             .setOnCancelListener { refresh() }
@@ -1010,6 +1160,7 @@ class MainActivity : Activity() {
         private var addAction: String? = null
         private var delAction: String? = null
         private var learned = false
+        private var referer: String? = null
 
         private fun open(path: String, post: Boolean): HttpURLConnection {
             if (!isPrivate(host)) throw Exception("Not a LAN address: $host")
@@ -1025,8 +1176,8 @@ class MainActivity : Activity() {
             c.setRequestProperty("Cookie", cookie)
             c.setRequestProperty("User-Agent", "Mozilla/5.0")
             // Same headers the router's own web page sends (copied from the browser capture)
-            c.setRequestProperty("Referer", "https://$host/html/bbsp/wlanmacfilter/set.cgi?" +
-                "x=InternetGatewayDevice.X_HW_Security&RequestFile=html/bbsp/wlanmacfilter/wlanmacfilter.asp")
+            c.setRequestProperty("Referer", referer ?: ("https://$host/html/bbsp/wlanmacfilter/set.cgi?" +
+                    "x=InternetGatewayDevice.X_HW_Security&RequestFile=html/bbsp/wlanmacfilter/wlanmacfilter.asp"))
             c.setRequestProperty("Origin", "https://$host")
             return c
         }
@@ -1046,8 +1197,8 @@ class MainActivity : Activity() {
             // 2) login (password is base64 in this firmware)
             val pw = Base64.encodeToString(pass.toByteArray(), Base64.NO_WRAP)
             val body = "UserName=" + URLEncoder.encode(user, "UTF-8") +
-                "&PassWord=" + URLEncoder.encode(pw, "UTF-8") +
-                "&Language=english&x.X_HW_Token=" + URLEncoder.encode(token, "UTF-8")
+                    "&PassWord=" + URLEncoder.encode(pw, "UTF-8") +
+                    "&Language=english&x.X_HW_Token=" + URLEncoder.encode(token, "UTF-8")
             val lc = open("/login.cgi", true)
             lc.doOutput = true
             lc.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
@@ -1058,8 +1209,11 @@ class MainActivity : Activity() {
             val session = sc?.map { it.substringBefore(';') }
                 ?.firstOrNull { it.contains("sid=", true) && !it.contains("id=-1") }
             if (session == null) {
+                if (loginBody.contains("upper threshold", true) || loginBody.contains("already logged", true))
+                    throw Exception("Router says another admin session is open (browser or earlier app login). " +
+                            "Close/log out there, wait ~5 min, then retry.")
                 val dbg = "HTTP ${lc.responseCode}, cookies=${sc ?: "none"}, body=" +
-                    loginBody.replace(Regex("\\s+"), " ").take(120)
+                        loginBody.replace(Regex("\\s+"), " ").take(120)
                 throw Exception("Login rejected. $dbg")
             }
             cookie = session
@@ -1093,14 +1247,14 @@ class MainActivity : Activity() {
             val txt = read(c)
             val loc = c.getHeaderField("Location") ?: ""
             lastDebug = "POST $path\nbody: " + body.replace(Regex("X_HW_Token=[^&]*"), "X_HW_Token=***") +
-                "\nHTTP $code" + (if (loc.isNotEmpty()) "\nLocation: $loc" else "") +
-                "\nreply: " + txt.replace(Regex("\\s+"), " ").take(300)
+                    "\nHTTP $code" + (if (loc.isNotEmpty()) "\nLocation: $loc" else "") +
+                    "\nreply: " + txt.replace(Regex("\\s+"), " ").take(300)
             val note = Regex("""alert\(['"]([^'"]{0,120})""").find(txt)?.groupValues?.get(1)
                 ?: Regex("""errorcode[^;<]{0,60}""", RegexOption.IGNORE_CASE).find(txt)?.value ?: ""
             log.add(path.substringAfterLast('/').take(90) + " | body keys: " +
-                body.split('&').joinToString(",") { it.substringBefore('=').takeLast(40) } +
-                " | token len ${Regex("X_HW_Token=([^&]*)").find(body)?.groupValues?.get(1)?.length ?: 0}" +
-                " | HTTP $code | len ${txt.length} | $note")
+                    body.split('&').joinToString(",") { it.substringBefore('=').takeLast(40) } +
+                    " | token len ${Regex("X_HW_Token=([^&]*)").find(body)?.groupValues?.get(1)?.length ?: 0}" +
+                    " | HTTP $code | len ${txt.length} | $note")
             if (code in 300..399 && loc.contains("login", true)) throw Exception("Session expired. Tap Get devices.")
             if (code >= 400) throw Exception("HTTP $code")
             return txt
@@ -1129,7 +1283,7 @@ class MainActivity : Activity() {
             pageSample = if (i >= 0)
                 html.substring(maxOf(0, i - 100), minOf(html.length, i + 400)).replace(Regex("\\s+"), " ")
             else "(no WLANMacFilter text in page, length ${html.length}) " +
-                html.take(200).replace(Regex("\\s+"), " ")
+                    html.take(200).replace(Regex("\\s+"), " ")
             fun around(key: String): String {
                 val j = html.indexOf(key)
                 return if (j < 0) "(no $key in page)"
@@ -1139,7 +1293,7 @@ class MainActivity : Activity() {
             val toks = Regex("<input[^>]*token[^>]*>", RegexOption.IGNORE_CASE).findAll(html).take(3)
                 .joinToString("\n") { it.value.replace(Regex("value=\"[^\"]*\""), "value=\"***\"") }
             jsSample = "DEL: " + around("del.cgi") + "\n\nADD: " + around("add.cgi") +
-                "\n\nparams:\n" + params + "\n\ntoken inputs:\n" + toks
+                    "\n\nparams:\n" + params + "\n\ntoken inputs:\n" + toks
             return parseFilter(html)
         }
 
@@ -1162,7 +1316,7 @@ class MainActivity : Activity() {
                     val t = (if (kind == 0) cfgToken() else pageToken()) ?: continue
                     // same fields and order as the router's own web page
                     post(u, "x.SourceMACAddress=${enc(mac.lowercase())}&x.SSIDName=${enc("SSID-$ssid")}" +
-                        "&x.DeviceName=${enc(name)}&x.Enable=1&x.X_HW_Token=${enc(t)}")
+                            "&x.DeviceName=${enc(name)}&x.Enable=1&x.X_HW_Token=${enc(t)}")
                     if (filterList().any { it.mac.equals(mac, true) }) return
                 } catch (e: Exception) { }
             }
@@ -1214,7 +1368,7 @@ class MainActivity : Activity() {
             val html = read(open(FILTER_PAGE, false))
             val i = html.indexOf("EnableMacFilter")
             val ctx = if (i >= 0) squash(html.substring(maxOf(0, i - 500), minOf(html.length, i + 500)))
-                else "(no EnableMacFilter in page)"
+            else "(no EnableMacFilter in page)"
             val ap = Regex("addParameter\\([^)]{0,80}\\)").findAll(html).map { it.value }.distinct()
                 .take(14).joinToString("\n")
             val su = setUrlRe.findAll(html).map { it.groupValues[1] }.distinct().take(6).joinToString("\n")
@@ -1226,7 +1380,7 @@ class MainActivity : Activity() {
             val vars = Regex("""(?:var\s+)?(?:enableFilter|Mode)\s*=[^;\n]{0,60}""").findAll(html)
                 .take(6).joinToString("\n") { squash(it.value) }
             modeSample = "SubmitForm:\n$sub\n\nBindFields: $bf\n\nvars:\n$vars\n\nAROUND EnableMacFilter:\n$ctx\n\n" +
-                "addParameter:\n$ap\n\nset.cgi urls:\n$su"
+                    "addParameter:\n$ap\n\nset.cgi urls:\n$su"
             val m = stateRe.find(html)
             if (m != null) return m.groupValues[1] == "1"
             val m2 = enableRe.find(html)
@@ -1243,7 +1397,7 @@ class MainActivity : Activity() {
             // Same request the router's own page sends (browser capture):
             // Right = "Enable WLAN MAC Filter" checkbox (1 on, 0 off); Policy = mode, 1 = whitelist
             val url = "/html/bbsp/wlanmacfilter/set.cgi?x=InternetGatewayDevice.X_HW_Security" +
-                "&RequestFile=${FILTER_PAGE.trimStart('/')}"
+                    "&RequestFile=${FILTER_PAGE.trimStart('/')}"
             val v = if (on) "1" else "0"
             for (kind in 0..1) {
                 try {
@@ -1253,6 +1407,43 @@ class MainActivity : Activity() {
                     if (s == null || s == on) return
                 } catch (e: Exception) { }
             }
+        }
+
+        // Current 2.4G (SSID1) Wi-Fi password. The router's WlanBasic page prints it in plain text
+        // (wifiPasswordMask = 0) and its own Apply button resubmits it with every save, so we do the same.
+        private fun currentWifiKey(): String {
+            val html = read(open(WLAN_PAGE, false))
+            val m = Regex("""WLANConfiguration\\x2e1\\x2ePreSharedKey\\x2e1"\s*,\s*"([^"]*)""").find(html)
+            val key = m?.let { unescape(it.groupValues[1]) }.orEmpty()
+            if (key.isEmpty()) throw Exception("Cannot read the current Wi-Fi password from the router page.")
+            return key
+        }
+
+        // SSID1 (2.4G) name + password. Fields copied from a browser capture of the router's own
+        // page: it resubmits the whole form, so only SSID and key change, the rest stays as captured.
+        // Band steering shares one SSID/password, so this single request covers both bands.
+        // pass blank = name-only change: the current key is read from the router and sent back unchanged.
+        fun setWifi(ssid: String, pass: String) {
+            log.clear()
+            val y = "$WLAN_OBJ.1"
+            val url = "$WLAN_SET?w=$WLAN_COVER&y=$y&z=$y.WPS&k=$y.PreSharedKey.1" +
+                    "&RequestFile=${WLAN_PAGE.trimStart('/')}"
+            referer = "https://$host$WLAN_PAGE"
+            try {
+                val n = enc(ssid)
+                val p = enc(pass.ifEmpty { currentWifiKey() })
+                val body = "y.Enable=1&y.SSIDAdvertisementEnabled=1&y.SSID=$n&y.X_HW_AssociateNum=10" +
+                        "&y.BeaconType=11i&y.IEEE11iAuthenticationMode=PSKAuthentication" +
+                        "&y.IEEE11iEncryptionModes=AESEncryption&k.PreSharedKey=$p&y.X_HW_GroupRekey=3600" +
+                        "&z.Enable=0&z.X_HW_ConfigMethod=PushButton&w.SsidInst=1&w.SSID=$n&w.Enable=1" +
+                        "&w.Standard=11bgn&w.BasicAuthenticationMode=None&w.BasicEncryptionModes=AESEncryption" +
+                        "&w.WPAAuthenticationMode=EAPAuthentication&w.WPAEncryptionModes=AESEncryption" +
+                        "&w.IEEE11iAuthenticationMode=PSKAuthentication&w.IEEE11iEncryptionModes=AESEncryption" +
+                        "&w.MixAuthenticationMode=EAPAuthentication&w.MixEncryptionModes=AESEncryption" +
+                        "&w.SSIDAdvertisementEnabled=1&w.WMMEnable=1&w.MaxAssociateNum=10&w.BeaconType=11i" +
+                        "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(cfgToken())}"
+                post(url, body)
+            } finally { referer = null }
         }
     }
 
@@ -1279,7 +1470,7 @@ class MainActivity : Activity() {
     private val ipRe = Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")
     private val skipRe = Regex(
         "^(InternetGatewayDevice.*|LAN\\d*|SSID[-_ ]?\\d*|WIFI.*|Ethernet.*|2\\.4G|5G|DHCP|Static|" +
-            "Online|Offline|Active|Inactive|--|N/A|IPv4|IPv6|\\d+|[\\d:]+)$", RegexOption.IGNORE_CASE)
+                "Online|Offline|Active|Inactive|--|N/A|IPv4|IPv6|\\d+|[\\d:]+)$", RegexOption.IGNORE_CASE)
 
     private fun parse(text: String): List<Dev> {
         val out = ArrayList<Dev>()
@@ -1382,7 +1573,7 @@ class MainActivity : Activity() {
     private fun startMonitor() {
         if (running) return
         running = true
-        Thread {
+        monitor = Thread {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             while (running) {
                 val w = wm.connectionInfo
@@ -1408,6 +1599,78 @@ class MainActivity : Activity() {
                     showStats(connected, ssid, rssi, freq, linkSpeed, router, net, hist, gw)
                 }
                 try { Thread.sleep(2000) } catch (e: InterruptedException) { break }
+            }
+        }.also { it.start() }
+    }
+
+    // ---------- speed test (Cloudflare) ----------
+    private fun mbps(bytes: Long, nanos: Long) = bytes * 8.0 * 1000.0 / nanos
+    private fun fmtMbps(v: Double) = String.format(java.util.Locale.US, "%.1f Mbps", v)
+
+    private fun speedDown(onTick: (Double) -> Unit): Double {
+        val c = URL("https://speed.cloudflare.com/__down?bytes=20000000").openConnection() as HttpURLConnection
+        c.connectTimeout = 5000
+        c.readTimeout = 8000
+        val buf = ByteArray(65536)
+        var total = 0L
+        var last = 0L
+        val t0 = System.nanoTime()
+        try {
+            c.inputStream.use { ins ->
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    total += n
+                    val now = System.nanoTime()
+                    if (now - last > 250_000_000L) { last = now; onTick(mbps(total, now - t0)) }
+                    if (now - t0 > 8_000_000_000L) break
+                }
+            }
+        } finally { c.disconnect() }
+        return mbps(total, System.nanoTime() - t0)
+    }
+
+    private fun speedUp(): Double {
+        val size = 8_000_000
+        val c = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.doOutput = true
+        c.connectTimeout = 5000
+        c.readTimeout = 15000
+        c.setFixedLengthStreamingMode(size)
+        val chunk = ByteArray(65536)
+        val t0 = System.nanoTime()
+        try {
+            c.outputStream.use { os ->
+                var sent = 0
+                while (sent < size) {
+                    val n = minOf(chunk.size, size - sent)
+                    os.write(chunk, 0, n)
+                    sent += n
+                }
+            }
+            c.responseCode
+        } finally { c.disconnect() }
+        return mbps(size.toLong(), System.nanoTime() - t0)
+    }
+
+    private fun runSpeedTest() {
+        if (testing) return
+        testing = true
+        vDown.text = "--"
+        vUp.text = "--"
+        speedStatus.text = "Testing download ..."
+        Thread {
+            var err = ""
+            try {
+                val d = speedDown { v -> runOnUiThread { vDown.text = fmtMbps(v) } }
+                runOnUiThread { vDown.text = fmtMbps(d); speedStatus.text = "Testing upload ..." }
+                val u = speedUp()
+                runOnUiThread { vUp.text = fmtMbps(u) }
+            } catch (e: Exception) { err = e.message ?: "error" }
+            runOnUiThread {
+                testing = false
+                speedStatus.text = if (err.isEmpty()) "Done." else "Failed: $err"
             }
         }.start()
     }
@@ -1451,25 +1714,33 @@ class MainActivity : Activity() {
         // Router endpoints for WLAN MAC filter. If add/remove fail, confirm in browser F12 > Network and edit here.
         private const val FILTER_PAGE = "/html/bbsp/wlanmacfilter/wlanmacfilter.asp"
         private const val FILTER_OBJ = "InternetGatewayDevice.X_HW_Security.WLANMacFilter"
+        // Router endpoints for Wi-Fi name/password. Query copied from F12; the set.cgi path itself is assumed.
+        private const val WLAN_PAGE = "/html/amp/wlanbasic/WlanBasic.asp"
+        private const val WLAN_COVER = "InternetGatewayDevice.X_HW_DEBUG.AMP.WifiCoverSetWlanBasic"
+        private const val WLAN_SET = "/html/amp/wlanbasic/set.cgi"
+        private const val WLAN_OBJ = "InternetGatewayDevice.LANDevice.1.WLANConfiguration"
 
         private fun hex(s: String) = Color.parseColor(s)
 
+        private val GRAD_LIGHT = intArrayOf(hex("#BCD7FF"), hex("#DCCBFF"), hex("#FFD3E6"))
+        private val GRAD_DARK = intArrayOf(hex("#0B1226"), hex("#1E1547"), hex("#33143F"))
+
         private val LIGHT = Pal(
             dark = false,
-            bg = hex("#F2F4F8"), surface = hex("#FFFFFF"), tile = hex("#F5F7FB"), tag = hex("#F2F4F8"),
-            line = hex("#DDE2EA"), text = hex("#1B1F27"), muted = hex("#5B6472"),
-            header = hex("#1565C0"), statusBar = hex("#0D47A1"), headerSub = hex("#DCEBFF"),
-            accent = hex("#1565C0"), accentSoft = hex("#E3EEFB"), onFill = hex("#FFFFFF"),
-            good = hex("#2E7D32"), goodSoft = hex("#E6F4E7"), bad = hex("#C62828"), badSoft = hex("#FBE9E9"),
-            warn = hex("#E09B00"))
+            bg = hex("#DCCBFF"), surface = hex("#B3FFFFFF"), tile = hex("#80FFFFFF"), tag = hex("#66FFFFFF"),
+            line = hex("#99FFFFFF"), text = hex("#1C1C1E"), muted = hex("#5A5A60"),
+            header = Color.TRANSPARENT, statusBar = Color.TRANSPARENT, headerSub = hex("#5A5A60"),
+            accent = hex("#0A74E0"), accentSoft = hex("#260A84FF"), onFill = hex("#FFFFFF"),
+            good = hex("#1E8E3E"), goodSoft = hex("#2630D158"), bad = hex("#D70015"), badSoft = hex("#26FF3B30"),
+            warn = hex("#C77700"))
 
         private val DARK = Pal(
             dark = true,
-            bg = hex("#0E1217"), surface = hex("#181D25"), tile = hex("#212832"), tag = hex("#252C37"),
-            line = hex("#2C3440"), text = hex("#E8EBF0"), muted = hex("#98A2B3"),
-            header = hex("#102B4E"), statusBar = hex("#0A1F3A"), headerSub = hex("#B7CCE8"),
-            accent = hex("#7AB4F5"), accentSoft = hex("#1F3858"), onFill = hex("#0B1626"),
-            good = hex("#6FCF73"), goodSoft = hex("#1D3524"), bad = hex("#F07272"), badSoft = hex("#3B2226"),
+            bg = hex("#1E1547"), surface = hex("#26FFFFFF"), tile = hex("#1FFFFFFF"), tag = hex("#1AFFFFFF"),
+            line = hex("#40FFFFFF"), text = hex("#F2F2F7"), muted = hex("#AEAEB8"),
+            header = Color.TRANSPARENT, statusBar = Color.TRANSPARENT, headerSub = hex("#AEAEB8"),
+            accent = hex("#5AA9FF"), accentSoft = hex("#3340A0FF"), onFill = hex("#06121F"),
+            good = hex("#4ADE80"), goodSoft = hex("#2630D158"), bad = hex("#FF6B6B"), badSoft = hex("#26FF453A"),
             warn = hex("#FFC247"))
     }
 }
