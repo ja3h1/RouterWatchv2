@@ -32,7 +32,10 @@ import android.text.InputType
 import android.text.TextUtils
 import android.util.Base64
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
+import android.view.animation.OvershootInterpolator
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -226,6 +229,31 @@ class MainActivity : Activity() {
 
     private fun dlg() = AlertDialog.Builder(this,
         if (pal.dark) AlertDialog.THEME_DEVICE_DEFAULT_DARK else AlertDialog.THEME_DEVICE_DEFAULT_LIGHT)
+
+    // ---------- press animation for every clickable view ----------
+    private var pressed: View? = null
+
+    private fun findClickable(v: View, x: Float, y: Float): View? {
+        if (v.visibility != View.VISIBLE) return null
+        val l = IntArray(2)
+        v.getLocationOnScreen(l)
+        if (x < l[0] || x > l[0] + v.width || y < l[1] || y > l[1] + v.height) return null
+        if (v is ViewGroup) for (i in v.childCount - 1 downTo 0) findClickable(v.getChildAt(i), x, y)?.let { return it }
+        return if (v.isClickable && v !is EditText) v else null
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> pressed = findClickable(window.decorView, ev.rawX, ev.rawY)?.also {
+                it.animate().scaleX(0.94f).scaleY(0.94f).setDuration(90).setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> pressed?.let {
+                it.animate().scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(OvershootInterpolator(2.5f)).start()
+                pressed = null
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
 
     // ---------- small UI helpers ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -598,27 +626,46 @@ class MainActivity : Activity() {
     }
 
     // ---------- 2.4 GHz channel + width recommendation ----------
-    // Scores channels 1/6/11 by neighbour signal; overlap weight falls off with channel distance.
-    // shortcut: own router skipped by BSSID prefix (first 5 octets), fine for Huawei.
+    // Scores channels by neighbour signal; overlap weight falls off with channel distance.
+    // 2.4G: all of 1-13 (Philippines). 5G: only non-DFS 36-48 and 149-161 (no radar hops).
+    // shortcut: own router skipped by BSSID prefix (first 5 octets), fine for Huawei. 5G neighbours' bonded width ignored.
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
-    private fun recommend24(): Triple<Int, Boolean, String>? {
+    private fun recommend(five: Boolean): Triple<Int, Boolean, String>? {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val all = wm.scanResults   // call scanThen() first so this is fresh
         if (all.isEmpty()) return null
         val own = wm.connectionInfo?.bssid?.take(14) ?: ""
-        val aps = all.filter { it.frequency in 2400..2500 && !(own.isNotEmpty() && it.BSSID?.startsWith(own, true) == true) }
-        val score = listOf(1, 6, 11).associateWith { cand ->
+        val aps = all.filter { (if (five) it.frequency in 5000..5900 else it.frequency in 2400..2500) && !(own.isNotEmpty() && it.BSSID?.startsWith(own, true) == true) }
+        val span = if (five) 4 else 5
+        val base = if (five) 5000 else 2407
+        val score = (if (five) listOf(36, 40, 44, 48, 149, 153, 157, 161) else (1..13).toList()).associateWith { cand ->
             aps.map { ap ->
-                val d = Math.abs((ap.frequency - 2407) / 5 - cand)
-                if (d >= 5) 0 else (ap.level + 100).coerceAtLeast(1) * (5 - d)
+                val d = Math.abs((ap.frequency - base) / 5 - cand)
+                if (d >= span) 0 else (ap.level + 100).coerceAtLeast(1) * (span - d)
             }.sum()
         }
         val best = score.minByOrNull { it.value }!!.key
         val wide = aps.size < 4   // 40 MHz only when the band is quiet
-        return Triple(best, wide, "Channel $best, ${if (wide) 40 else 20} MHz. " +
-                "${aps.size} other APs seen on 2.4 GHz; channel $best is the least crowded.")
+        return Triple(best, wide, "Channel $best, ${widthLabel(five, wide)}. " +
+                "${aps.size} other APs seen on ${if (five) 5 else 2.4} GHz; channel $best is the least crowded.")
     }
+
+    // Router's own AP in the last scan (same BSSID prefix as the connected one), so both bands work from either band.
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    private fun currentChan(five: Boolean): String {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val own = wm.connectionInfo?.bssid?.take(14) ?: return "Current: connect to the router Wi-Fi to see it."
+        val list: List<android.net.wifi.ScanResult> = try { wm.scanResults } catch (e: Exception) { emptyList() }
+        val ap = list.filter { it.BSSID?.startsWith(own, true) == true && (it.frequency > 4900) == five }
+            .maxByOrNull { it.level } ?: return "Current: tap Scan to read it."
+        val ch = (ap.frequency - if (five) 5000 else 2407) / 5
+        return "Current: channel $ch, ${intArrayOf(20, 40, 80, 160, 160).getOrElse(ap.channelWidth) { 20 }} MHz"
+    }
+
+    private fun widthLabel(five: Boolean, wide: Boolean) =
+        if (!wide) "20 MHz" else if (five) "Auto width" else "40 MHz"
 
     // start scan, wait for result broadcast (max 6 s), then call done. Throttled scan = use cached list.
     @SuppressLint("MissingPermission")
@@ -642,9 +689,10 @@ class MainActivity : Activity() {
         if (started) window.decorView.postDelayed({ fin() }, 6000) else fin()
     }
 
-    private fun chan24Card(): LinearLayout {
+    private fun chanCard(five: Boolean): LinearLayout {
         var rec: Pair<Int, Boolean>? = null
         val out = txt("Scan nearby Wi-Fi for a suggestion.", 12f, pal.text)
+        val cur = txt(currentChan(five), 12f, pal.muted)
         val scanBtn = pillButton("Scan", pal.accent, false) {
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
@@ -653,7 +701,8 @@ class MainActivity : Activity() {
             }
             out.text = "Scanning ..."
             scanThen {
-                val r = try { recommend24() } catch (e: Exception) { null }
+                cur.text = currentChan(five)
+                val r = try { recommend(five) } catch (e: Exception) { null }
                 if (r == null) out.text = "No scan data. Turn Location on, wait 30 s, retry."
                 else { rec = Pair(r.first, r.second); out.text = r.third }
             }
@@ -661,11 +710,11 @@ class MainActivity : Activity() {
         val applyBtn = pillButton("Apply", pal.accent, true) {
             val (ch, wide) = rec ?: return@pillButton
             val c = client ?: run { needLogin(); return@pillButton }
-            dlg().setTitle("Set 2.4 GHz to channel $ch, ${if (wide) 40 else 20} MHz?")
-                .setMessage("Devices on 2.4 GHz disconnect briefly.")
+            dlg().setTitle("Set ${if (five) 5 else 2.4} GHz to channel $ch, ${widthLabel(five, wide)}?")
+                .setMessage("Devices on ${if (five) 5 else 2.4} GHz disconnect briefly.")
                 .setPositiveButton("Apply") { _, _ ->
                     say("Changing channel ...")
-                    bg({ c.setChannel24(ch, wide) }) { r ->
+                    bg({ c.setChannel(five, ch, wide) }) { r ->
                         r.onSuccess { say("Sent. Reconnect if Wi-Fi dropped.") }
                         r.onFailure { say("Failed: ${it.message}") }
                     }
@@ -677,6 +726,7 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(txt("Recommended channel", 13f, pal.text, true).apply { setPadding(0, dp(12), 0, dp(4)) })
+            addView(cur)
             addView(out)
             addView(row(scanBtn, applyBtn).apply { setPadding(0, dp(8), 0, 0) })
         }
@@ -871,9 +921,9 @@ class MainActivity : Activity() {
         }
         val wifiNote = "Needs router login. Leave the name or the password blank to change only the other one."
         val w24 = panel().apply {
-            addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("2.4 GHz", 1)); addView(chan24Card())
+            addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("2.4 GHz", 1)); addView(chanCard(false))
         }
-        val w5 = panel().apply { addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("5 GHz", 5)) }
+        val w5 = panel().apply { addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("5 GHz", 5)); addView(chanCard(true)) }
         val wifiCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(12))
@@ -1012,7 +1062,7 @@ class MainActivity : Activity() {
         bg({ c.logout() }) { r ->
             val closed = r.getOrDefault(false)
             val msg = if (closed) "Logged out. Router session closed."
-                else "Logged out of the app. Router session may stay open about 5 min."
+            else "Logged out of the app. Router session may stay open about 5 min."
             say(msg)
             Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             if (!closed) showDebug("Logout - copy and send this", c.lastDebug.ifBlank { "no reply recorded" })
@@ -1697,19 +1747,21 @@ class MainActivity : Activity() {
                     "&w.SSIDAdvertisementEnabled=1&w.WMMEnable=1&w.MaxAssociateNum=10&w.BeaconType=11i" +
                     "&w.WEPEncryptionLevel=104-bit&w.WEPKeyIndex=1&w.Key=$p&x.X_HW_Token=${enc(token)}"
 
-        // 2.4G channel + width. Body copied from the browser capture (same endpoint for both changes).
-        // shortcut: HT20=1 assumed to mean 20 MHz and 0 = 20/40; other fields hardcoded to the captured values.
-        fun setChannel24(ch: Int, wide: Boolean) {
+        // Channel + width, 2.4G and 5G (bodies copied from browser captures, same endpoint for both changes).
+        // shortcut: HT20=1 assumed 20 MHz, 0 = auto (20/40 on 2.4G, up to 80 on 5G); other fields hardcoded to the captured values.
+        fun setChannel(five: Boolean, ch: Int, wide: Boolean) {
             log.clear()
-            val url = "$ADV_SET?x=$WLAN_OBJ.1.X_HW_AdvanceConf&y=$WLAN_OBJ.1" +
-                    "&r=InternetGatewayDevice.LANDevice.1.WiFi.Radio.1&RequestFile=${ADV_PAGE.trimStart('/')}"
+            val i = if (five) 5 else 1
+            val url = "$ADV_SET?" + (if (five) "z=InternetGatewayDevice.LANDevice.1.WiFi.X_HW_GlobalConfig&" else "") +
+                    "x=$WLAN_OBJ.$i.X_HW_AdvanceConf&y=$WLAN_OBJ.$i" +
+                    "&r=InternetGatewayDevice.LANDevice.1.WiFi.Radio.${if (five) 2 else 1}&RequestFile=${ADV_PAGE.trimStart('/')}"
             referer = "https://$host$ADV_PAGE"
             try {
                 // a wrong token is ignored silently, so send with both token kinds
                 for (kind in 0..1) try {
                     val t = (if (kind == 0) pageToken(ADV_PAGE) else cfgToken()) ?: continue
                     post(url, "y.Channel=$ch&y.AutoChannelEnable=0&y.X_HW_HT20=${if (wide) 0 else 1}" +
-                            "&y.RegulatoryDomain=PH&y.TransmitPower=100&y.X_HW_Standard=11bgn&x.DtimPeriod=1" +
+                            "&y.RegulatoryDomain=PH&y.TransmitPower=100&y.X_HW_Standard=${if (five) "11ac" else "11bgn"}&x.DtimPeriod=1" +
                             "&x.BeaconPeriod=100&x.RTSThreshold=2346&x.FragThreshold=2346&z.BandSteeringPolicy=1" +
                             "&x.X_HW_Token=${enc(t)}")
                 } catch (e: Exception) { }
