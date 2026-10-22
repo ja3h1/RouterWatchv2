@@ -447,7 +447,7 @@ class MainActivity : Activity() {
     private fun itemCard(
         name: String, sub: String, state: Int, ssid: String,
         action: String, actionColor: Int, onAction: () -> Unit, onTap: (() -> Unit)?,
-        onLong: (() -> Unit)? = null
+        onRename: (() -> Unit)? = null
     ): LinearLayout {
         val st = when (state) { 1 -> pal.good; 2 -> pal.bad; else -> pal.muted }
         val stSoft = when (state) { 1 -> pal.goodSoft; 2 -> pal.badSoft; else -> pal.tag }
@@ -496,18 +496,20 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(tag); addView(spacer)
+            if (onRename != null) addView(pillButton("Rename", pal.muted, false) { onRename() }.apply {
+                layoutParams = LinearLayout.LayoutParams(WC, dp(44)).apply { setMargins(0, 0, dp(6), 0) }
+            })
             addView(pillButton(action, actionColor, false) { onAction() })
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, dp(8), 0, 0) }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = if (onTap != null || onLong != null) ripple(cardBg(), 24) else cardBg()
+            background = if (onTap != null) ripple(cardBg(), 24) else cardBg()
             elevation = 0f
             setPadding(dp(14), dp(12), dp(14), dp(12))
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(8)) }
             addView(top); addView(bottom)
             if (onTap != null) setOnClickListener { onTap() }
-            if (onLong != null) setOnLongClickListener { onLong(); true }
         }
     }
 
@@ -994,10 +996,12 @@ class MainActivity : Activity() {
                     saveLogin(user, pass)
                     say(if (list.isEmpty())
                         "Logged in, but no devices parsed. Page format may differ."
-                    else "${list.size} device(s). Tap = copy MAC. Long-press = rename. Button = add to filter.")
+                    else "${list.size} device(s). Tap = copy MAC. Buttons: Rename, add to filter.")
                     showPage(0)
                 }.onFailure { e ->
-                    say("Failed: ${e.message}")
+                    say("Failed: ${e.message?.take(160)}")
+                    if (e.message?.startsWith("Login rejected") == true)
+                        showDebug("Login rejected - copy and send this", e.message ?: "")
                 }
             }
         }.start()
@@ -1034,23 +1038,28 @@ class MainActivity : Activity() {
         openLogin()
     }
 
+    // same MAC may sit in both SSIDs, so "already listed" must check the SSID too
+    private fun inSsid(e: FilterEntry, mac: String, ssid: Int) =
+        e.mac.equals(mac, true) && (e.ssid.isBlank() || e.ssid.filter { it.isDigit() } == ssid.toString())
+
     private fun addToFilter(d: Dev) {
         val c = client ?: run { needLogin(); return }
         val name = showName(d.mac, d.host).ifBlank { "device" }.replace(Regex("[^A-Za-z0-9_.-]"), "-").take(31)
+        var pick = if (d.ssid == 5) 1 else 0   // 0 = SSID 1 (2.4G), 1 = SSID 5 (5G); starts on the device's own band
         dlg()
-            .setTitle("Add to router filter?")
-            .setMessage("$name\n${d.mac}  (SSID${d.ssid})\n\n" +
-                    "Router mode decides meaning: whitelist = allowed, blacklist = blocked.")
+            .setTitle("Add ${showName(d.mac, d.host).ifBlank { d.mac }} to filter list in:")
+            .setSingleChoiceItems(arrayOf("SSID 1 (2.4 GHz)", "SSID 5 (5 GHz)"), pick) { _, i -> pick = i }
             .setPositiveButton("Add") { _, _ ->
-                say("Adding ${d.mac} ...")
+                val ssid = if (pick == 1) 5 else 1
+                say("Adding ${d.mac} to SSID $ssid ...")
                 bg({
-                    c.addFilter(d.ssid, name, d.mac)
+                    c.addFilter(ssid, name, d.mac)
                     c.filterList()
                 }) { r ->
                     r.onSuccess { list ->
                         filterCache = list
-                        val ok = list.any { it.mac.equals(d.mac, true) }
-                        say(if (ok) "Added. Router lists ${d.mac}." else "Router did not add ${d.mac}.")
+                        val ok = list.any { inSsid(it, d.mac, ssid) }
+                        say(if (ok) "Added. Router lists ${d.mac} in SSID $ssid." else "Router did not add ${d.mac}.")
                         if (!ok) showDebug("Add failed - copy and send this",
                             c.log.joinToString("\n") + "\n\nentries read: ${list.size}\n\n" + c.jsSample)
                         if (tab == 1) refresh()
@@ -1323,8 +1332,13 @@ class MainActivity : Activity() {
                 if (loginBody.contains("upper threshold", true) || loginBody.contains("already logged", true))
                     throw Exception("Router says another admin session is open (browser or earlier app login). " +
                             "Close/log out there, wait ~5 min, then retry.")
-                val dbg = "HTTP ${lc.responseCode}, cookies=${sc ?: "none"}, body=" +
-                        loginBody.replace(Regex("\\s+"), " ").take(120)
+                // skip the DOCTYPE/head boilerplate so the router's own message is visible
+                val flat = loginBody.replace(Regex("\\s+"), " ")
+                val note = Regex("""alert\(['"]([^'"]{0,160})""").find(flat)?.groupValues?.get(1)
+                val dbg = "HTTP ${lc.responseCode}, cookies=${sc ?: "none"}, token len ${token.length}, " +
+                        "token cookie=${tc.headerFields["Set-Cookie"] ?: "none"}, user=${user.length} chars, pass=${pass.length} chars" +
+                        (if (note != null) ", router says: $note" else "") +
+                        ", page=" + flat.substringAfter("<body", flat).take(500)
                 throw Exception("Login rejected. $dbg")
             }
             cookie = session
@@ -1442,7 +1456,7 @@ class MainActivity : Activity() {
                     // same fields and order as the router's own web page
                     post(u, "x.SourceMACAddress=${enc(mac.lowercase())}&x.SSIDName=${enc("SSID-$ssid")}" +
                             "&x.DeviceName=${enc(name)}&x.Enable=1&x.X_HW_Token=${enc(t)}")
-                    if (filterList().any { it.mac.equals(mac, true) }) return
+                    if (filterList().any { inSsid(it, mac, ssid) }) return
                 } catch (e: Exception) { }
             }
         }
