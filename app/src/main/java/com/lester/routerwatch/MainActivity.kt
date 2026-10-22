@@ -74,6 +74,8 @@ const val ICON_SHIELD = 2
 const val ICON_GLOBE = 3
 const val ICON_PERSON = 4
 const val ICON_PULSE = 5
+const val ICON_WIFI = 6
+const val ICON_SLIDERS = 7
 
 /** Small line icons drawn with Canvas (24x24 grid, same shapes as the design). */
 class IconView(ctx: Context, private val kind: Int, tintColor: Int) : View(ctx) {
@@ -116,6 +118,17 @@ class IconView(ctx: Context, private val kind: Int, tintColor: Int) : View(ctx) 
                 path.moveTo(12f, 3f); path.cubicTo(9f, 6f, 9f, 18f, 12f, 21f)
                 cv.drawPath(path, p)
             }
+            ICON_WIFI -> {
+                cv.drawCircle(12f, 19f, 0.8f, p)
+                for (r in floatArrayOf(3.5f, 7f, 10.5f))
+                    cv.drawArc(RectF(12f - r, 19f - r, 12f + r, 19f + r), 225f, 90f, false, p)
+            }
+            ICON_SLIDERS -> {
+                cv.drawLine(4f, 7f, 6.8f, 7f, p); cv.drawLine(11.2f, 7f, 20f, 7f, p)
+                cv.drawCircle(9f, 7f, 2.2f, p)
+                cv.drawLine(4f, 17f, 12.8f, 17f, p); cv.drawLine(17.2f, 17f, 20f, 17f, p)
+                cv.drawCircle(15f, 17f, 2.2f, p)
+            }
             ICON_PULSE -> {
                 path.moveTo(3f, 12f); path.lineTo(8f, 12f); path.lineTo(10.5f, 5f)
                 path.lineTo(13.5f, 19f); path.lineTo(16f, 12f); path.lineTo(21f, 12f)
@@ -148,7 +161,11 @@ class MainActivity : Activity() {
     private lateinit var vDown: TextView
     private lateinit var vUp: TextView
     private lateinit var speedStatus: TextView
-    private lateinit var monitorPage: ScrollView
+    private lateinit var monitorPage: LinearLayout
+    private lateinit var wifiPage: LinearLayout
+    private lateinit var wifiStatus: TextView
+    private lateinit var titleView: TextView
+    private lateinit var refreshBtn: FrameLayout
     @Volatile private var testing = false
     private lateinit var userBox: EditText
     private lateinit var passBox: EditText
@@ -156,7 +173,7 @@ class MainActivity : Activity() {
     private lateinit var acctStatus: TextView
     private lateinit var deviceList: LinearLayout
     private lateinit var listPage: LinearLayout
-    private lateinit var accountPage: ScrollView
+    private lateinit var accountPage: LinearLayout
     private lateinit var chipBtns: List<TextView>
     private lateinit var tabBtns: List<TextView>
     private lateinit var themeBtns: List<TextView>
@@ -167,7 +184,11 @@ class MainActivity : Activity() {
     @Volatile private var client: RouterClient? = null
     private var devCache: List<Dev> = emptyList()
     private var filterCache: List<FilterEntry> = emptyList()
-    private var page = 0           // 0 = devices, 1 = filter list, 2 = account, 3 = monitor
+    private var page = 0           // 0 = devices, 1 = filter list, 2 = settings, 3 = network, 4 = wi-fi
+    private var netTab = 0         // network sub tab: 0 = live, 1 = speed test
+    private var wifiTab = 0        // wi-fi sub tab: 0 = 2.4 GHz, 1 = 5 GHz
+    private var setTab = 0         // settings sub tab: 0 = login, 1 = appearance, 2 = about
+    private var pickLogin: (Int) -> Unit = {}
     private var tab = 0            // list shown: 0 = devices, 1 = filter list
     private var statusFilter = 0   // 0 = all, 1 = online, 2 = offline
     private var wlEnabled: Boolean? = null   // router WLAN filter on/off, null = unknown
@@ -177,7 +198,7 @@ class MainActivity : Activity() {
     private var role = 0           // 0 = normal admin, 1 = super admin (own saved login each)
     private lateinit var roleBtns: List<TextView>
     private var pal: Pal = LIGHT
-    private var lastStatus = "Open Account, enter router login, then tap refresh."
+    private var lastStatus = "Open Settings, enter router login, then tap refresh."
     private val MP = LinearLayout.LayoutParams.MATCH_PARENT
     private val WC = LinearLayout.LayoutParams.WRAP_CONTENT
     @Volatile private var running = false
@@ -309,6 +330,29 @@ class MainActivity : Activity() {
         b.setTextColor(if (selected) pal.onFill else color)
     }
 
+    // Sub tabs: one bar, shows one of `views` at a time. Returns the bar and a function to pick a tab.
+    private fun segmented(labels: List<String>, views: List<View>, start: Int, onPick: (Int) -> Unit):
+            Pair<LinearLayout, (Int) -> Unit> {
+        val btns = ArrayList<TextView>()
+        fun select(i: Int) {
+            views.forEachIndexed { j, v -> v.visibility = if (i == j) View.VISIBLE else View.GONE }
+            btns.forEachIndexed { j, b -> paintTab(b, i == j) }
+            onPick(i)
+        }
+        labels.forEachIndexed { i, t -> btns.add(tabBtn(t) { select(i) }) }
+        select(start)
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = rounded(pal.tile, 26, pal.line, hair())
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            for (b in btns) addView(b)
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(12), dp(10), dp(12), 0) }
+        }
+        return Pair(bar, ::select)
+    }
+
+    private fun openLogin() { pickLogin(0); showPage(2) }
+
     private fun navItem(title: String, icon: Int, onClick: () -> Unit): LinearLayout {
         val ic = IconView(this, icon, pal.muted)
         val pill = FrameLayout(this).apply {
@@ -332,7 +376,7 @@ class MainActivity : Activity() {
 
     private fun paintNav() {
         for (i in navIcons.indices) {
-            val sel = when (i) { 0 -> page == 0; 1 -> page == 1; 2 -> page == 3; 3 -> page == 2; else -> false }
+            val sel = when (i) { 0 -> page < 2; 1 -> page == 3; 2 -> page == 4; 3 -> page == 2; else -> false }
             navPills[i].background = rounded(if (sel) pal.accentSoft else Color.TRANSPARENT, 15)
             navIcons[i].tint(if (sel) pal.accent else pal.muted)
             navLabels[i].setTextColor(if (sel) pal.accent else pal.muted)
@@ -350,6 +394,9 @@ class MainActivity : Activity() {
         listPage.visibility = if (p < 2) View.VISIBLE else View.GONE
         accountPage.visibility = if (p == 2) View.VISIBLE else View.GONE
         monitorPage.visibility = if (p == 3) View.VISIBLE else View.GONE
+        wifiPage.visibility = if (p == 4) View.VISIBLE else View.GONE
+        titleView.text = when (p) { 2 -> "Settings"; 3 -> "Network"; 4 -> "Wi-Fi"; else -> "Devices" }
+        refreshBtn.visibility = if (p < 2) View.VISIBLE else View.INVISIBLE
         paintNav()
         if (p < 2) refresh()
     }
@@ -380,6 +427,7 @@ class MainActivity : Activity() {
         lastStatus = s
         if (::status.isInitialized) status.text = s
         if (::acctStatus.isInitialized) acctStatus.text = s
+        if (::wifiStatus.isInitialized) wifiStatus.text = s
     }
 
     // ---------- cards ----------
@@ -574,13 +622,14 @@ class MainActivity : Activity() {
 
         // ----- header -----
         subtitle = txt("Starting...", 12f, pal.headerSub)
+        titleView = txt("Devices", 26f, pal.text, true)
         val titleCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-            addView(txt("RouterWatch", 26f, pal.text, true))
+            addView(titleView)
             addView(subtitle)
         }
-        val refreshBtn = FrameLayout(this).apply {
+        refreshBtn = FrameLayout(this).apply {
             contentDescription = "Get devices"
             background = ripple(oval(pal.surface), 22)
             layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
@@ -708,23 +757,42 @@ class MainActivity : Activity() {
                 setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL))) }
             })
         }
-        val wifiCard = panel().apply {
-            addView(txt("Wi-Fi name and password", 15f, pal.text, true))
-            addView(txt("Needs router login. 2.4G and 5G are changed separately. " +
-                    "Leave the name or the password blank to change only the other one.", 12f, pal.muted))
-            addView(wifiBlock("2.4 GHz", 1))
-            addView(wifiBlock("5 GHz", 5))
-        }
         val acctCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(12))
             addView(loginCard)
-            addView(wifiCard)
             addView(themeCard)
             addView(aboutCard)
         }
-        accountPage = ScrollView(this).apply {
-            addView(acctCol)
+        val (setBar, setPick) = segmented(listOf("Login", "Appearance", "About"),
+            listOf(loginCard, themeCard, aboutCard), setTab) { setTab = it }
+        pickLogin = setPick
+        accountPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(setBar)
+            addView(ScrollView(this@MainActivity).apply { addView(acctCol) }, LinearLayout.LayoutParams(MP, 0, 1f))
+            layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
+        }
+
+        // ----- wi-fi page: one band per sub tab -----
+        wifiStatus = txt(lastStatus, 12f, pal.muted).apply {
+            maxLines = 2
+            layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(16), dp(8), dp(16), 0) }
+        }
+        val wifiNote = "Needs router login. Leave the name or the password blank to change only the other one."
+        val w24 = panel().apply { addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("2.4 GHz", 1)) }
+        val w5 = panel().apply { addView(txt(wifiNote, 12f, pal.muted)); addView(wifiBlock("5 GHz", 5)) }
+        val wifiCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(12))
+            addView(w24); addView(w5)
+        }
+        val (wifiBar, _) = segmented(listOf("2.4 GHz", "5 GHz"), listOf(w24, w5), wifiTab) { wifiTab = it }
+        wifiPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(wifiBar)
+            addView(wifiStatus)
+            addView(ScrollView(this@MainActivity).apply { addView(wifiCol) }, LinearLayout.LayoutParams(MP, 0, 1f))
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
         }
 
@@ -749,8 +817,11 @@ class MainActivity : Activity() {
             addView(statsCard)
             addView(speedCard)
         }
-        monitorPage = ScrollView(this).apply {
-            addView(monCol)
+        val (netBar, _) = segmented(listOf("Live", "Speed test"), listOf(statsCard, speedCard), netTab) { netTab = it }
+        monitorPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(netBar)
+            addView(ScrollView(this@MainActivity).apply { addView(monCol) }, LinearLayout.LayoutParams(MP, 0, 1f))
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
         }
 
@@ -760,15 +831,16 @@ class MainActivity : Activity() {
             background = rounded(pal.surface, 32, pal.line, hair())
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(16), dp(4), dp(16), dp(12)) }
             addView(navItem("Devices", ICON_DEVICES) { showPage(0) })
-            addView(navItem("Filter list", ICON_SHIELD) { openFilter() })
-            addView(navItem("Monitor", ICON_PULSE) { showPage(3) })
-            addView(navItem("Account", ICON_PERSON) { showPage(2) })
+            addView(navItem("Network", ICON_PULSE) { showPage(3) })
+            addView(navItem("Wi-Fi", ICON_WIFI) { showPage(4) })
+            addView(navItem("Settings", ICON_SLIDERS) { showPage(2) })
         }
 
         root.addView(header)
         root.addView(listPage)
         root.addView(accountPage)
         root.addView(monitorPage)
+        root.addView(wifiPage)
         root.addView(nav)
         setContentView(root)
 
@@ -842,7 +914,7 @@ class MainActivity : Activity() {
         wlEnabled = null
         if (c != null) Thread { c.logout() }.start()
         say("Logged out. Tap Get devices to log in again.")
-        showPage(2)
+        openLogin()
     }
 
     private fun forgetLogin() {
@@ -890,7 +962,7 @@ class MainActivity : Activity() {
         val pass = passBox.text.toString()
         if (user.isEmpty() || pass.isEmpty()) {
             say("Fill account + password.")
-            showPage(2)
+            openLogin()
             return
         }
         val host = gatewayIp() ?: targetHost
@@ -947,8 +1019,8 @@ class MainActivity : Activity() {
     }
 
     private fun needLogin() {
-        say("Login first (Account tab, then tap refresh).")
-        showPage(2)
+        say("Login first (Settings tab, then tap refresh).")
+        openLogin()
     }
 
     private fun addToFilter(d: Dev) {
