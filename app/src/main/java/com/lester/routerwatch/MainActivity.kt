@@ -365,6 +365,11 @@ class MainActivity : Activity() {
         if (tab == 0) renderDevices(devCache) else renderFilter(filterCache)
     }
 
+    private fun showRaw() {
+        val t = client?.devSample ?: return
+        if (t.isNotBlank()) showDebug("Raw device data - hide private info, then copy", t)
+    }
+
     private fun say(s: String) {
         lastStatus = s
         if (::status.isInitialized) status.text = s
@@ -544,6 +549,7 @@ class MainActivity : Activity() {
         }
         status = txt(lastStatus, 12f, pal.muted).apply {
             maxLines = 2
+            setOnClickListener { showRaw() }
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(dp(16), dp(8), dp(16), 0) }
         }
         deviceList = LinearLayout(this).apply {
@@ -564,7 +570,10 @@ class MainActivity : Activity() {
         // ----- account page: login + appearance -----
         userBox = field("Router account", false).apply { setText(keepUser) }
         passBox = field("Router password", true).apply { setText(keepPass) }
-        acctStatus = txt(lastStatus, 12f, pal.muted).apply { setPadding(dp(2), dp(8), dp(2), 0) }
+        acctStatus = txt(lastStatus, 12f, pal.muted).apply {
+            setPadding(dp(2), dp(8), dp(2), 0)
+            setOnClickListener { showRaw() }
+        }
         val getBtn = pillButton("Get devices", pal.accent, true) { fetchDevices() }.apply {
             layoutParams = LinearLayout.LayoutParams(0, dp(48), 2f).apply { setMargins(0, dp(8), dp(4), 0) }
         }
@@ -734,7 +743,7 @@ class MainActivity : Activity() {
                     saveLogin(user, pass)
                     say(if (list.isEmpty())
                         "Logged in, but no devices parsed. Page format may differ."
-                    else "${list.size} device(s). Tap card = copy MAC. Button = add to router filter.")
+                    else "${list.size} device(s). Tap card = copy MAC. Tap this text = raw router data.")
                     showPage(0)
                 }.onFailure { e ->
                     say("Failed: ${e.message}")
@@ -1066,17 +1075,27 @@ class MainActivity : Activity() {
             if (loginBody.isEmpty() && lc.responseCode >= 400) throw Exception("Login HTTP ${lc.responseCode}")
         }
 
+        var devSample = ""
+
         fun devices(): List<Dev> {
             val paths = listOf(
                 "/html/bbsp/common/GetLanUserDevInfo.asp",
                 "/html/bbsp/common/GetLanUserInfo.asp"
             )
+            val sb = StringBuilder()
             for (p in paths) {
                 try {
-                    val list = parse(read(open(p, false)))
-                    if (list.isNotEmpty()) return list
-                } catch (e: Exception) { }
+                    val txt = read(open(p, false))
+                    val classes = Regex("new\\s+(\\w+)\\s*\\(").findAll(txt)
+                        .groupingBy { it.groupValues[1] }.eachCount()
+                    val recs = Regex("new\\s+\\w+\\s*\\(([^)]{0,500})\\)").findAll(txt).take(2)
+                        .joinToString("\n") { unescape(it.value) }
+                    sb.append("$p | len ${txt.length} | classes $classes\n$recs\n\n")
+                    val list = parse(txt)
+                    if (list.isNotEmpty()) { devSample = sb.toString(); return list }
+                } catch (e: Exception) { sb.append("$p failed: ${e.message}\n\n") }
             }
+            devSample = sb.toString()
             return emptyList()
         }
 
@@ -1293,7 +1312,7 @@ class MainActivity : Activity() {
             val st = strs.firstOrNull { it.equals("online", true) || it.equals("offline", true) } ?: ""
             val host = strs.firstOrNull {
                 it.isNotBlank() && !macRe.matches(it) && !ipRe.matches(it) && !skipRe.matches(it)
-            } ?: ""
+            } ?: strs.getOrNull(8)?.takeIf { it.isNotBlank() && !macRe.matches(it) && !ipRe.matches(it) } ?: ""
             val ssid = strs.firstNotNullOfOrNull {
                 Regex("^SSID[-_ ]?(\\d+)$", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull()
             } ?: 1
