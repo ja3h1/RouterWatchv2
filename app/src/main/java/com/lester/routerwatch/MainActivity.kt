@@ -1,6 +1,7 @@
 package com.lester.routerwatch
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
@@ -599,13 +600,14 @@ class MainActivity : Activity() {
     // ---------- 2.4 GHz channel + width recommendation ----------
     // Scores channels 1/6/11 by neighbour signal; overlap weight falls off with channel distance.
     // shortcut: own router skipped by BSSID prefix (first 5 octets), fine for Huawei.
+    @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     private fun recommend24(): Triple<Int, Boolean, String>? {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val all = wm.scanResults   // call scanThen() first so this is fresh
         if (all.isEmpty()) return null
         val own = wm.connectionInfo?.bssid?.take(14) ?: ""
-        val aps = all.filter { it.frequency in 2400..2500 && !(own.isNotEmpty() && it.BSSID.startsWith(own, true)) }
+        val aps = all.filter { it.frequency in 2400..2500 && !(own.isNotEmpty() && it.BSSID?.startsWith(own, true) == true) }
         val score = listOf(1, 6, 11).associateWith { cand ->
             aps.map { ap ->
                 val d = Math.abs((ap.frequency - 2407) / 5 - cand)
@@ -619,6 +621,7 @@ class MainActivity : Activity() {
     }
 
     // start scan, wait for result broadcast (max 6 s), then call done. Throttled scan = use cached list.
+    @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     private fun scanThen(done: () -> Unit) {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -635,7 +638,8 @@ class MainActivity : Activity() {
             override fun onReceive(c: Context?, i: Intent?) { fin() }
         }
         registerReceiver(rx, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION))
-        if (wm.startScan()) window.decorView.postDelayed({ fin() }, 6000) else fin()
+        val started = try { wm.startScan() } catch (e: SecurityException) { false }  // missing CHANGE_WIFI_STATE
+        if (started) window.decorView.postDelayed({ fin() }, 6000) else fin()
     }
 
     private fun chan24Card(): LinearLayout {
@@ -649,7 +653,7 @@ class MainActivity : Activity() {
             }
             out.text = "Scanning ..."
             scanThen {
-                val r = try { recommend24() } catch (e: SecurityException) { null }
+                val r = try { recommend24() } catch (e: Exception) { null }
                 if (r == null) out.text = "No scan data. Turn Location on, wait 30 s, retry."
                 else { rec = Pair(r.first, r.second); out.text = r.third }
             }
