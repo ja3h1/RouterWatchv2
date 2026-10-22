@@ -3,10 +3,12 @@ package com.lester.routerwatch
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
@@ -600,8 +602,7 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     private fun recommend24(): Triple<Int, Boolean, String>? {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wm.startScan()  // Android throttles scans, so results may be a few minutes old
-        val all = wm.scanResults
+        val all = wm.scanResults   // call scanThen() first so this is fresh
         if (all.isEmpty()) return null
         val own = wm.connectionInfo?.bssid?.take(14) ?: ""
         val aps = all.filter { it.frequency in 2400..2500 && !(own.isNotEmpty() && it.BSSID.startsWith(own, true)) }
@@ -617,13 +618,41 @@ class MainActivity : Activity() {
                 "${aps.size} other APs seen on 2.4 GHz; channel $best is the least crowded.")
     }
 
+    // start scan, wait for result broadcast (max 6 s), then call done. Throttled scan = use cached list.
+    @Suppress("DEPRECATION")
+    private fun scanThen(done: () -> Unit) {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        var fired = false
+        lateinit var rx: BroadcastReceiver
+        val fin: () -> Unit = {
+            if (!fired) {
+                fired = true
+                try { unregisterReceiver(rx) } catch (e: Exception) {}
+                done()
+            }
+        }
+        rx = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) { fin() }
+        }
+        registerReceiver(rx, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION))
+        if (wm.startScan()) window.decorView.postDelayed({ fin() }, 6000) else fin()
+    }
+
     private fun chan24Card(): LinearLayout {
         var rec: Pair<Int, Boolean>? = null
         val out = txt("Scan nearby Wi-Fi for a suggestion.", 12f, pal.text)
         val scanBtn = pillButton("Scan", pal.accent, false) {
-            val r = try { recommend24() } catch (e: SecurityException) { null }
-            if (r == null) out.text = "No scan data. Allow Location, turn it on, retry."
-            else { rec = Pair(r.first, r.second); out.text = r.third }
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
+                out.text = "Allow Location permission, then tap Scan again."
+                return@pillButton
+            }
+            out.text = "Scanning ..."
+            scanThen {
+                val r = try { recommend24() } catch (e: SecurityException) { null }
+                if (r == null) out.text = "No scan data. Turn Location on, wait 30 s, retry."
+                else { rec = Pair(r.first, r.second); out.text = r.third }
+            }
         }
         val applyBtn = pillButton("Apply", pal.accent, true) {
             val (ch, wide) = rec ?: return@pillButton
