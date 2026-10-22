@@ -908,12 +908,23 @@ class MainActivity : Activity() {
     // End the router session and clear loaded data. Saved login stays (use Forget login to erase it).
     private fun logOut() {
         val c = client
+        if (c == null) {
+            Toast.makeText(this, "Not logged in", Toast.LENGTH_SHORT).show()
+            return
+        }
         client = null
         devCache = emptyList()
         filterCache = emptyList()
         wlEnabled = null
-        if (c != null) Thread { c.logout() }.start()
-        say("Logged out. Tap Get devices to log in again.")
+        say("Logging out of the router ...")
+        bg({ c.logout() }) { r ->
+            val closed = r.getOrDefault(false)
+            val msg = if (closed) "Logged out. Router session closed."
+                else "Logged out of the app. Router session may stay open about 5 min."
+            say(msg)
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            if (!closed) showDebug("Logout - copy and send this", c.lastDebug.ifBlank { "no reply recorded" })
+        }
         openLogin()
     }
 
@@ -1334,10 +1345,18 @@ class MainActivity : Activity() {
             return emptyList()
         }
 
-        // Frees the router's admin session slot. Endpoint is assumed (Huawei web UI style); errors ignored.
-        fun logout() {
-            try { post("/logout.cgi?RequestFile=html/logout.html", "x.X_HW_Token=" + enc(cfgToken())) }
-            catch (e: Exception) { }
+        // Frees the router's admin session slot. Address and token source copied from the browser capture.
+        // A redirect to the login page throws in post(), so ignore errors and test the session instead:
+        // returns true when the old cookie no longer reads any devices.
+        fun logout(): Boolean {
+            lastDebug = ""
+            try {
+                // logout takes its token from GetRandToken.asp (copied from the browser capture), not getRandString.asp
+                val t = read(open("/html/ssmp/common/GetRandToken.asp", true)).replace("\uFEFF", "").trim()
+                post("/logout.cgi?RequestFile=html/logout.html", "x.X_HW_Token=" + enc(t))
+            }
+            catch (e: Exception) { lastDebug += "\nerror: " + e.message }
+            return devices().isEmpty()
         }
 
         // ---- config writes need a fresh token per request ----
