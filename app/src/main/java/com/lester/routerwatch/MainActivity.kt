@@ -49,6 +49,8 @@ import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
 import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.cert.CertificateException
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import javax.crypto.Cipher
@@ -60,6 +62,8 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
+
+class LoginProblem(m: String) : Exception(m)
 
 data class Dev(val host: String, val ip: String, val mac: String, val status: String, val ssid: Int = 1)
 data class FilterEntry(val domain: String, val ssid: String, val name: String, val mac: String)
@@ -155,6 +159,7 @@ class IconView(ctx: Context, private val kind: Int, tintColor: Int) : View(ctx) 
 class MainActivity : Activity() {
     private lateinit var subtitle: TextView
     private lateinit var statsCard: LinearLayout
+    private lateinit var vRing: RingView
     private lateinit var vSignal: TextView
     private lateinit var vSignalSub: TextView
     private lateinit var vLink: TextView
@@ -327,7 +332,7 @@ class MainActivity : Activity() {
             setTextColor(if (filled) pal.onFill else color)
             background = ripple(rounded(if (filled) color else pal.surface, 22, color, hair()), 22)
             setPadding(dp(18), 0, dp(18), 0)
-            layoutParams = LinearLayout.LayoutParams(WC, dp(44))
+            layoutParams = LinearLayout.LayoutParams(WC, dp(48))
             setOnClickListener { onClick() }
         }
 
@@ -337,7 +342,7 @@ class MainActivity : Activity() {
         textSize = 14f
         typeface = Typeface.DEFAULT_BOLD
         gravity = Gravity.CENTER
-        layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f)
+        layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f)
         setOnClickListener { onClick() }
     }
 
@@ -345,7 +350,7 @@ class MainActivity : Activity() {
         textSize = 13f
         typeface = Typeface.DEFAULT_BOLD
         gravity = Gravity.CENTER
-        layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
+        layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
         setOnClickListener { onClick() }
     }
 
@@ -399,6 +404,8 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(0, dp(64), 1f)
+            contentDescription = title
+            isClickable = true
             addView(pill)
             addView(lab)
             setOnClickListener { onClick() }
@@ -462,6 +469,8 @@ class MainActivity : Activity() {
     }
 
     // ---------- cards ----------
+    private fun rowBg() = rounded(pal.surface, 12, pal.line, hair())
+
     private fun cardBg() = rounded(pal.surface, 24, pal.line, hair())
 
     private fun bgGrad() = GradientDrawable(GradientDrawable.Orientation.TL_BR,
@@ -528,14 +537,14 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(tag); addView(spacer)
             if (onRename != null) addView(pillButton("Rename", pal.muted, false) { onRename() }.apply {
-                layoutParams = LinearLayout.LayoutParams(WC, dp(44)).apply { setMargins(0, 0, dp(6), 0) }
+                layoutParams = LinearLayout.LayoutParams(WC, dp(48)).apply { setMargins(0, 0, dp(6), 0) }
             })
             addView(pillButton(action, actionColor, false) { onAction() })
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, dp(8), 0, 0) }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = if (onTap != null) ripple(cardBg(), 24) else cardBg()
+            background = if (onTap != null) ripple(rowBg(), 24) else rowBg()
             elevation = 0f
             setPadding(dp(14), dp(12), dp(14), dp(12))
             layoutParams = LinearLayout.LayoutParams(MP, WC).apply { setMargins(0, 0, 0, dp(8)) }
@@ -544,9 +553,14 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun emptyNote(noData: Boolean) = txt(
-        if (noData) "Nothing here yet. Tap the refresh button." else "Nothing matches this filter.",
-        12f, pal.muted).apply { setPadding(dp(4), dp(12), dp(4), 0) }
+    private fun emptyNote(noData: Boolean): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(4), dp(12), dp(4), 0)
+        addView(txt(if (noData) "No devices loaded yet." else "Nothing matches this filter.", 13f, pal.muted))
+        if (noData) addView(pillButton("Get devices", pal.accent, true) { fetchDevices() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).setMargins(0, dp(10), 0, 0)
+        })
+    }
 
     private fun ssidLabel(s: String) =
         if (s.isBlank()) "SSID --" else if (s.startsWith("SSID", true)) s else "SSID-$s"
@@ -631,37 +645,64 @@ class MainActivity : Activity() {
     // shortcut: own router skipped by BSSID prefix (first 5 octets), fine for Huawei. 5G neighbours' bonded width ignored.
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
+    private fun qWord(dbm: Int) = when { dbm >= -55 -> "Excellent"; dbm >= -67 -> "Good"; dbm >= -75 -> "Fair"; else -> "Weak" }
+
+    // The router's own access points in a scan (same SSID + same vendor prefix as the connected one), both bands.
+    @Suppress("DEPRECATION")
+    private fun ownAps(wm: WifiManager, all: List<android.net.wifi.ScanResult>): List<android.net.wifi.ScanResult> {
+        val info = wm.connectionInfo
+        val b = info?.bssid ?: return emptyList()
+        val ssid = info.ssid?.trim('"') ?: ""
+        return all.filter {
+            val id = it.BSSID ?: ""
+            id.equals(b, true) || id.startsWith(b.take(14), true) ||
+                (ssid.isNotEmpty() && ssid != "<unknown ssid>" && it.SSID == ssid && id.take(8).equals(b.take(8), true))
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
     private fun recommend(five: Boolean): Triple<Int, Boolean, String>? {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val all = wm.scanResults   // call scanThen() first so this is fresh
         if (all.isEmpty()) return null
-        val own = wm.connectionInfo?.bssid?.take(14) ?: ""
-        val aps = all.filter { (if (five) it.frequency in 5000..5900 else it.frequency in 2400..2500) && !(own.isNotEmpty() && it.BSSID?.startsWith(own, true) == true) }
+        val own = ownAps(wm, all).map { it.BSSID }.toSet()
+        val aps = all.filter { (if (five) it.frequency in 5000..5900 else it.frequency in 2400..2500) && it.BSSID !in own }
         val span = if (five) 4 else 5
         val base = if (five) 5000 else 2407
-        val score = (if (five) listOf(36, 40, 44, 48, 149, 153, 157, 161) else (1..13).toList()).associateWith { cand ->
+        // 2.4 GHz: only 1, 6, 11 do not overlap each other
+        val cands = if (five) listOf(36, 40, 44, 48, 149, 153, 157, 161) else listOf(1, 6, 11)
+        fun chOf(ap: android.net.wifi.ScanResult) = (ap.frequency - base) / 5
+        val score = cands.associateWith { cand ->
             aps.map { ap ->
-                val d = Math.abs((ap.frequency - base) / 5 - cand)
+                val d = Math.abs(chOf(ap) - cand)
                 if (d >= span) 0 else (ap.level + 100).coerceAtLeast(1) * (span - d)
             }.sum()
         }
         val best = score.minByOrNull { it.value }!!.key
-        val wide = aps.size < 4   // 40 MHz only when the band is quiet
-        return Triple(best, wide, "Channel $best, ${widthLabel(five, wide)}. " +
-                "${aps.size} other APs seen on ${if (five) 5 else 2.4} GHz; channel $best is the least crowded.")
+        val wide = aps.size < (if (five) 4 else 2)   // wide channel only when the band is quiet
+        val rows = cands.joinToString("\n") { c ->
+            val near = aps.filter { Math.abs(chOf(it) - c) < span }
+            val info = if (near.isEmpty()) "free" else "${near.size} APs, strongest ${near.maxOf { it.level }} dBm"
+            "Channel $c: $info" + if (c == best) "  <- best" else ""
+        }
+        val band = if (five) "5 GHz" else "2.4 GHz"
+        return Triple(best, wide, "Best: channel $best, ${widthLabel(five, wide)}\n" +
+            "${aps.size} other Wi-Fi networks seen on $band\n$rows")
     }
 
-    // Router's own AP in the last scan (same BSSID prefix as the connected one), so both bands work from either band.
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     private fun currentChan(five: Boolean): String {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val own = wm.connectionInfo?.bssid?.take(14) ?: return "Current: connect to the router Wi-Fi to see it."
+        val band = if (five) "5 GHz" else "2.4 GHz"
+        if (wm.connectionInfo?.bssid == null) return "Your $band Wi-Fi: connect to the router Wi-Fi to see it."
         val list: List<android.net.wifi.ScanResult> = try { wm.scanResults } catch (e: Exception) { emptyList() }
-        val ap = list.filter { it.BSSID?.startsWith(own, true) == true && (it.frequency > 4900) == five }
-            .maxByOrNull { it.level } ?: return "Current: tap Scan to read it."
+        val ap = ownAps(wm, list).filter { (it.frequency > 4900) == five }.maxByOrNull { it.level }
+            ?: return "Your $band Wi-Fi: not seen yet. Tap Scan, and check this band is on in the router."
         val ch = (ap.frequency - if (five) 5000 else 2407) / 5
-        return "Current: channel $ch, ${intArrayOf(20, 40, 80, 160, 160).getOrElse(ap.channelWidth) { 20 }} MHz"
+        val w = intArrayOf(20, 40, 80, 160, 160).getOrElse(ap.channelWidth) { 20 }
+        return "Your $band Wi-Fi: channel $ch, $w MHz\nSignal: ${ap.level} dBm (${qWord(ap.level)})"
     }
 
     private fun widthLabel(five: Boolean, wide: Boolean) =
@@ -721,7 +762,7 @@ class MainActivity : Activity() {
                 }
                 .setNegativeButton("Cancel", null).show()
         }.apply {
-            layoutParams = LinearLayout.LayoutParams(WC, dp(44)).apply { setMargins(dp(8), 0, 0, 0) }
+            layoutParams = LinearLayout.LayoutParams(WC, dp(48)).apply { setMargins(dp(8), 0, 0, 0) }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -772,7 +813,7 @@ class MainActivity : Activity() {
         refreshBtn = FrameLayout(this).apply {
             contentDescription = "Get devices"
             background = ripple(oval(pal.surface), 22)
-            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
             addView(IconView(this@MainActivity, ICON_REFRESH, pal.accent),
                 FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             setOnClickListener { fetchDevices() }
@@ -792,11 +833,15 @@ class MainActivity : Activity() {
         val (tRouter, rv, rs) = tile("Router ping"); vRouter = rv; vRouterSub = rs
         val (tNet, nv, ns) = tile("Internet ping"); vNet = nv; vNetSub = ns
         vBars = BarsView(this)
+        vRing = RingView(this)
         statsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = cardBg()
             elevation = 0f
             setPadding(dp(6), dp(6), dp(6), dp(10))
+            addView(vRing, LinearLayout.LayoutParams(dp(168), dp(168)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL; setMargins(0, dp(8), 0, dp(4))
+            })
             addView(row(tSignal, tLink))
             addView(row(tRouter, tNet))
             addView(vBars, LinearLayout.LayoutParams(MP, dp(24)).apply { setMargins(dp(8), dp(8), dp(8), 0) })
@@ -870,6 +915,9 @@ class MainActivity : Activity() {
             addView(passBox)
             addView(row(getBtn, forgetBtn))
             addView(logoutBtn)
+            addView(pillButton("Join history", pal.accent, false) { showHistory() }.apply {
+                layoutParams = LinearLayout.LayoutParams(MP, dp(48)).apply { setMargins(0, dp(8), 0, 0) }
+            })
             addView(acctStatus)
         }
         themeBtns = listOf("System", "Light", "Dark").mapIndexed { i, t -> tabBtn(t) { setThemeMode(i) } }
@@ -1071,7 +1119,9 @@ class MainActivity : Activity() {
     }
 
     private fun forgetLogin() {
-        prefs.edit().remove(userKey()).remove(passKey()).apply()
+        val ed = prefs.edit().remove(userKey()).remove(passKey())
+        prefs.all.keys.filter { it.startsWith("pin_") }.forEach { ed.remove(it) }
+        ed.apply()
         userBox.setText("")
         passBox.setText("")
         client = null
@@ -1114,7 +1164,7 @@ class MainActivity : Activity() {
         val user = userBox.text.toString().trim()
         val pass = passBox.text.toString()
         if (user.isEmpty() || pass.isEmpty()) {
-            say("Fill account + password.")
+            say("Enter your router account and password.")
             openLogin()
             return
         }
@@ -1133,13 +1183,16 @@ class MainActivity : Activity() {
             runOnUiThread {
                 result.onSuccess { list ->
                     devCache = list
+                    recordHistory(list)
                     saveLogin(user, pass)
                     say(if (list.isEmpty())
-                        "Logged in, but no devices parsed. Page format may differ."
+                        "Logged in, but the device list is empty. The router page may have changed."
                     else "${list.size} device(s). Tap = copy MAC. Buttons: Rename, add to filter.")
                     showPage(0)
                 }.onFailure { e ->
-                    say("Failed: ${e.message?.take(160)}")
+                    say(friendly(e))
+                    if (e is LoginProblem) dlg().setTitle("Cannot log in").setMessage(e.message)
+                        .setPositiveButton("OK", null).show()
                     if (e.message?.startsWith("Login rejected") == true)
                         showDebug("Login rejected - copy and send this", e.message ?: "")
                 }
@@ -1162,6 +1215,48 @@ class MainActivity : Activity() {
     }
 
     // ---------- router MAC filter (whitelist / blacklist per router mode) ----------
+    // Saved only when you refresh in the app. Not a background log.
+    private fun recordHistory(list: List<Dev>) {
+        val now = System.currentTimeMillis()
+        val onNow = list.filter { stateOfDev(it) == 1 }.map { it.mac.lowercase() }.toSet()
+        val prev = prefs.getString("online_set", null)?.split(",")?.filter { it.isNotBlank() }?.toSet()
+        val names = list.associate { it.mac.lowercase() to showName(it.mac, it.host).ifBlank { it.mac } }
+        val fresh = ArrayList<String>()
+        if (prev != null) {
+            for (m in onNow - prev) fresh.add("$now|J|${names[m] ?: m}|$m")
+            for (m in prev - onNow) fresh.add("$now|L|${names[m] ?: m}|$m")
+        }
+        val ed = prefs.edit().putString("online_set", onNow.joinToString(","))
+        if (fresh.isNotEmpty()) {
+            val old = prefs.getString("hist", "")!!.split("\n").filter { it.isNotBlank() }
+            ed.putString("hist", (fresh + old).take(200).joinToString("\n"))
+        }
+        ed.apply()
+    }
+
+    private fun showHistory() {
+        val f = java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
+        val text = prefs.getString("hist", "")!!.split("\n").filter { it.isNotBlank() }.joinToString("\n") {
+            val p = it.split("|")
+            if (p.size < 4) it
+            else "${f.format(java.util.Date(p[0].toLongOrNull() ?: 0L))}   ${if (p[1] == "J") "Joined" else "Left"}   ${p[2]}"
+        }.ifBlank { "No changes yet. Each refresh compares who is online with the last refresh." }
+        showDebug("Join history (last 200)", text)
+    }
+
+    private fun friendly(e: Throwable): String {
+        val m = e.message ?: ""
+        return when {
+            e is LoginProblem -> m
+            m.contains("certificate changed", true) -> m.substringAfter("CertificateException: ")
+            e is java.net.UnknownHostException || e is java.net.SocketTimeoutException ||
+                e is java.net.ConnectException || m.contains("Not a LAN", true) ->
+                "Router not reachable. Join your home Wi-Fi and try again."
+            m.contains("Session expired", true) -> "Session ended. Tap Get devices to log in again."
+            else -> "Failed: ${m.take(160)}"
+        }
+    }
+
     private fun showDebug(title: String, text: String) {
         dlg().setTitle(title).setMessage(text)
             .setPositiveButton("Copy") { _, _ ->
@@ -1413,7 +1508,16 @@ class MainActivity : Activity() {
     private inner class RouterClient(private val host: String) {
         private val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
             override fun checkClientTrusted(c: Array<X509Certificate>?, a: String?) {}
-            override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {}
+            override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {
+                val cert = c?.firstOrNull() ?: throw CertificateException("Router sent no certificate")
+                val fp = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
+                    .joinToString("") { "%02x".format(it) }
+                val saved = prefs.getString("pin_$host", null)
+                if (saved == null) prefs.edit().putString("pin_$host", fp).apply()
+                else if (saved != fp) throw CertificateException(
+                    "Router certificate changed. If you did not reset the router, someone may be faking it. " +
+                    "Account, Forget login, then try again to trust the new one.")
+            }
             override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
         })
         private var cookie = "Cookie=body:Language:english:id=-1;path=/"
@@ -1473,9 +1577,23 @@ class MainActivity : Activity() {
             val session = sc?.map { it.substringBefore(';') }
                 ?.firstOrNull { it.contains("sid=", true) && !it.contains("id=-1") }
             if (session == null) {
-                if (loginBody.contains("upper threshold", true) || loginBody.contains("already logged", true))
-                    throw Exception("Router says another admin session is open (browser or earlier app login). " +
-                            "Close/log out there, wait ~5 min, then retry.")
+                // Classify the router's own message (alert text, else visible page text without scripts)
+                val flat0 = loginBody.replace(Regex("\\s+"), " ")
+                val note0 = Regex("""alert\(['"]([^'"]{0,160})""").find(flat0)?.groupValues?.get(1)
+                val low = note0?.let { unescape(it).lowercase() }
+                    ?: unescape(flat0).replace(Regex("(?i)<script.*?</script>"), " ")
+                        .replace(Regex("<[^>]+>"), " ").lowercase()
+                when {
+                    Regex("upper (limit|threshold)|reach\\w* (the )?(upper |max\\w* )?(limit|threshold)|too many|already log|max\\w* (number of )?(user|login|session)")
+                        .containsMatchIn(low) -> throw LoginProblem(
+                        "Router has too many admin sessions open. Log out of the router web page on every device, " +
+                        "wait about 5 minutes, then try again.")
+                    Regex("locked|try again (after|in)|(wait|retry).{0,20}(minute|second)").containsMatchIn(low) ->
+                        throw LoginProblem("This router account is locked for a while. Wait a few minutes, then try again.")
+                    Regex("incorrect|wrong|invalid|password error|not correct").containsMatchIn(low) ->
+                        throw LoginProblem("Wrong account or password. Check both, and check that Normal admin or " +
+                            "Super admin matches the account you typed.")
+                }
                 // skip the DOCTYPE/head boilerplate so the router's own message is visible
                 val flat = loginBody.replace(Regex("\\s+"), " ")
                 val note = Regex("""alert\(['"]([^'"]{0,160})""").find(flat)?.groupValues?.get(1)
@@ -1889,6 +2007,8 @@ class MainActivity : Activity() {
         vNetSub.text = pingWord(net)
         vNetSub.setTextColor(pingColor(net))
         vBars.submit(hist)
+        vRing.set(if (net < 0) 0f else (1f - net / 300f).coerceIn(0.06f, 1f), pingColor(net),
+            if (net < 0) "--" else "$net", if (net < 0) "no reply" else "ms to internet")
     }
 
     @Suppress("DEPRECATION")
@@ -1998,6 +2118,41 @@ class MainActivity : Activity() {
     }
 
     // ping history as small bars (newest on the right)
+    // The one memorable element: ring fills and changes color with internet ping.
+    private inner class RingView(ctx: Context) : View(ctx) {
+        private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = dp(12).toFloat()
+        }
+        private val arc = Paint(track)
+        private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD }
+        private val small = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+        private var frac = 0f
+        private var col = Color.GRAY
+        private var num = "--"
+        private var lab = ""
+
+        fun set(f: Float, c: Int, n: String, l: String) {
+            frac = f; col = c; num = n; lab = l
+            contentDescription = "Internet ping $n, $l"
+            invalidate()
+        }
+
+        override fun onDraw(cv: Canvas) {
+            val s = minOf(width, height).toFloat()
+            if (s <= 0f) return
+            val pad = track.strokeWidth
+            val box = RectF(pad, pad, s - pad, s - pad)
+            track.color = pal.tag
+            cv.drawArc(box, 135f, 270f, false, track)
+            arc.color = col
+            cv.drawArc(box, 135f, 270f * frac, false, arc)
+            big.color = pal.text; big.textSize = s * 0.26f
+            cv.drawText(num, s / 2, s / 2 + big.textSize * 0.2f, big)
+            small.color = pal.muted; small.textSize = s * 0.09f
+            cv.drawText(lab, s / 2, s / 2 + s * 0.24f, small)
+        }
+    }
+
     private inner class BarsView(ctx: Context) : View(ctx) {
         private var data: List<Int> = emptyList()
         private val p = Paint(Paint.ANTI_ALIAS_FLAG)
